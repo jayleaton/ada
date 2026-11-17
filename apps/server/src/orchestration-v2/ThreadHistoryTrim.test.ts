@@ -6,6 +6,7 @@ import {
   type OrchestrationV2AppThread,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2Run,
+  type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   ProjectId,
   ProviderInstanceId,
@@ -25,16 +26,20 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { visibleConversationItems } from "./ContextHandoffService.ts";
 import * as EventSink from "./EventSink.ts";
 import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ProjectStore from "./ProjectStore.ts";
 import * as ThreadHistoryTrim from "./ThreadHistoryTrim.ts";
+import { buildBoundedThreadStreamSnapshot } from "./ThreadStream.ts";
 
 const database = SqlitePersistence.layerMemory;
 const stores = Layer.mergeAll(
   database,
   EventStore.layer.pipe(Layer.provideMerge(database)),
   ProjectionStore.layer.pipe(Layer.provideMerge(database)),
+  ProjectStore.layer.pipe(Layer.provideMerge(database)),
 );
 const dependencies = (afterDays: number) =>
   Layer.mergeAll(
@@ -57,6 +62,7 @@ type SeedOptions = {
   readonly thread?: Partial<OrchestrationV2AppThread>;
   readonly runStatus?: OrchestrationV2Run["status"];
   readonly userMessageAt?: DateTime.Utc;
+  readonly extraReasoning?: number;
 };
 
 const seedThread = Effect.fn(function* (name: string, options: SeedOptions = {}) {
@@ -201,6 +207,14 @@ const seedThread = Effect.fn(function* (name: string, options: SeedOptions = {})
         attachments: [],
       }),
       item({ ...itemBase("reasoning"), type: "reasoning", text: "thinking", streaming: false }),
+      ...Array.from({ length: options.extraReasoning ?? 0 }, (_, index) =>
+        item({
+          ...itemBase(`reasoning-${index}`),
+          type: "reasoning",
+          text: "more thinking",
+          streaming: false,
+        }),
+      ),
       item({
         ...itemBase("command", commandNodeId),
         type: "command_execution",
@@ -227,6 +241,27 @@ const seedThread = Effect.fn(function* (name: string, options: SeedOptions = {})
         output: "The draft the user was asked to read.",
       }),
       item({
+        ...itemBase("html"),
+        type: "dynamic_tool",
+        toolName: "mcp__t3-code__html_render",
+        input: null,
+        output: { htmlRender: { title: "Chart" } },
+      }),
+      item({
+        ...itemBase("app"),
+        type: "dynamic_tool",
+        toolName: "mcp__charts__show",
+        input: null,
+        output: { t3McpApp: { resourceUri: "ui://charts/show" } },
+      }),
+      item({
+        ...itemBase("task"),
+        type: "dynamic_tool",
+        toolName: "mcp__t3-code__delegate_task",
+        input: null,
+        output: "The delegated task's result.",
+      }),
+      item({
         ...itemBase("assistant"),
         type: "assistant_message",
         messageId: assistantMessageId,
@@ -237,6 +272,49 @@ const seedThread = Effect.fn(function* (name: string, options: SeedOptions = {})
   });
   return { threadId, runId };
 });
+
+const openPullRequest = {
+  host: "github.com",
+  repository: "acme/app",
+  number: 7,
+  url: "https://github.com/acme/app/pull/7",
+  source: "agent",
+  linkedAt: DateTime.formatIso(old),
+  snapshot: {
+    state: "open",
+    title: "Fix harness",
+    headBranch: "fix",
+    baseBranch: "main",
+    isDraft: false,
+    updatedAt: null,
+    syncedAt: DateTime.formatIso(old),
+  },
+  stack: null,
+} satisfies NonNullable<OrchestrationV2AppThread["pullRequests"]>[number];
+
+const createProject = Effect.flatMap(ProjectStore.ProjectStoreV2, (projects) =>
+  projects.apply({
+    sequence: 0,
+    eventId: EventId.make("created:project:trim"),
+    aggregateKind: "project",
+    aggregateId: ProjectId.make("project:trim"),
+    occurredAt: DateTime.formatIso(old),
+    commandId: null,
+    causationEventId: null,
+    correlationId: null,
+    metadata: {},
+    type: "project.created",
+    payload: {
+      projectId: ProjectId.make("project:trim"),
+      title: "trim",
+      workspaceRoot: "/work/trim",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: DateTime.formatIso(old),
+      updatedAt: DateTime.formatIso(old),
+    },
+  }),
+);
 
 const itemTitles = Effect.fn(function* (threadId: ThreadId) {
   const sql = yield* SqlClient.SqlClient;
@@ -249,9 +327,17 @@ const itemTitles = Effect.fn(function* (threadId: ThreadId) {
   return rows.map((row) => row.title);
 });
 
-const everyItem = ["user", "reasoning", "command", "tool", "edit", "sent", "assistant"];
-// `sent` stays: the timeline always shows that output inline.
-const trimmedItems = ["user", "tool", "edit", "sent", "assistant", "Older detail was trimmed"];
+const inlineItems = ["sent", "html", "app", "task"];
+const everyItem = ["user", "reasoning", "command", "tool", "edit", ...inlineItems, "assistant"];
+// Inline items stay: the timeline always shows that output.
+const trimmedItems = [
+  "user",
+  "tool",
+  "edit",
+  ...inlineItems,
+  "assistant",
+  "Older detail was trimmed",
+];
 
 const trim = Effect.gen(function* () {
   const service = yield* ThreadHistoryTrim.ThreadHistoryTrim;
@@ -272,13 +358,30 @@ it.layer(layerTest(30))("ThreadHistoryTrim", (it) => {
       const preview = yield* service.preview;
       assert.deepEqual(
         { dryRun: preview.dryRun, threadCount: preview.threadCount, itemCount: preview.itemCount },
-        { dryRun: true, threadCount: 1, itemCount: 3 },
+        { dryRun: true, threadCount: 1, itemCount: everyItem.length - trimmedItems.length + 1 },
       );
-      assert.isAbove(preview.estimatedBytes, 8_000);
+      assert.isAbove(preview.estimatedBytes, 4_000);
       assert.deepEqual(yield* itemTitles(threadId), everyItem);
 
+      const inlineIds = inlineItems.map((key) => `item:idle:${key}`);
       const report = yield* trim;
       assert.equal(report.dryRun, false);
+      // What the web and mobile timelines, exports and transfers read keeps every inline output.
+      const snapshot = yield* store.getThreadSnapshot(threadId);
+      const wire = buildBoundedThreadStreamSnapshot(snapshot);
+      const { turnItems, ...records } = yield* store.getThreadRecords(threadId, [
+        "turnItems",
+        "runs",
+        "attempts",
+      ]);
+      const readers = {
+        timeline: snapshot.projection.visibleTurnItems.map((row) => row.sourceItemId),
+        wire: wire.projection.visibleTurnItems.map((row) => row.sourceItemId),
+        transfer: visibleConversationItems(records, turnItems).map((item) => item.id),
+      };
+      for (const [reader, shown] of Object.entries(readers)) {
+        assert.includeMembers(shown, inlineIds, reader);
+      }
       // `tool` stays: the kept file change hangs off it.
       assert.deepEqual(yield* itemTitles(threadId), trimmedItems);
       const nodes = yield* sql<{ readonly node_id: string }>`
@@ -334,26 +437,7 @@ it.layer(layerTest(30))("ThreadHistoryTrim", (it) => {
         }),
         yield* seedThread("open-pr", {
           thread: {
-            pullRequests: [
-              {
-                host: "github.com",
-                repository: "acme/app",
-                number: 7,
-                url: "https://github.com/acme/app/pull/7",
-                source: "agent",
-                linkedAt: DateTime.formatIso(old),
-                snapshot: {
-                  state: "open",
-                  title: "Fix harness",
-                  headBranch: "fix",
-                  baseBranch: "main",
-                  isDraft: false,
-                  updatedAt: null,
-                  syncedAt: DateTime.formatIso(old),
-                },
-                stack: null,
-              },
-            ],
+            pullRequests: [openPullRequest],
           },
         }),
         yield* seedThread("side-chat", {
@@ -397,6 +481,223 @@ it.layer(layerTest(30))("ThreadHistoryTrim", (it) => {
     }),
   );
 });
+
+type Hook = Effect.Effect<
+  void,
+  unknown,
+  | EventSink.EventSinkV2
+  | EventStore.EventStoreV2
+  | ProjectionStore.ProjectionStoreV2
+  | ServerSettings.ServerSettingsService
+>;
+const isNotice = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
+  events.some(
+    (event) => event.type === "turn-item.updated" && event.payload.type === "system_notice",
+  );
+/** Runs `hook` at the pass's `atWrite`th write: after it chose what to remove, before removing it. */
+const duringTrim = (hook: Hook, atWrite = 1) => {
+  const hooked = Layer.effect(
+    EventSink.EventSinkV2,
+    Effect.gen(function* () {
+      const sink = yield* EventSink.EventSinkV2;
+      const context = yield* Effect.context<Effect.Services<Hook>>();
+      let writes = 0;
+      const next = Effect.suspend(() =>
+        ++writes === atWrite ? hook.pipe(Effect.provide(context), Effect.orDie) : Effect.void,
+      );
+      return EventSink.EventSinkV2.of({
+        ...sink,
+        write: (input) =>
+          sink.write(input).pipe(Effect.tap(() => (isNotice(input.events) ? next : Effect.void))),
+        writeBuilt: (build) => next.pipe(Effect.andThen(sink.writeBuilt(build))),
+      });
+    }),
+  );
+  return ThreadHistoryTrim.layer.pipe(Layer.provide(hooked), Layer.provideMerge(dependencies(30)));
+};
+
+const updateThread = (
+  name: string,
+  type: OrchestrationV2DomainEvent["type"],
+  patch: Partial<OrchestrationV2AppThread>,
+): Hook =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make(`thread:trim:${name}`);
+    const thread = yield* (yield* ProjectionStore.ProjectionStoreV2).getThread(threadId);
+    yield* (yield* EventSink.EventSinkV2).write({
+      events: [
+        {
+          id: EventId.make(`event:${name}:activity`),
+          type,
+          threadId,
+          occurredAt: now,
+          payload: { ...thread, ...patch },
+        } as OrchestrationV2DomainEvent,
+      ],
+    });
+  });
+const writeActivity = (name: string, event: (threadId: ThreadId, runId: RunId) => object): Hook =>
+  Effect.gen(function* () {
+    const threadId = ThreadId.make(`thread:trim:${name}`);
+    const runId = RunId.make(`run:${threadId}:2`);
+    yield* (yield* EventSink.EventSinkV2).write({
+      events: [
+        {
+          id: EventId.make(`event:${name}:activity`),
+          threadId,
+          runId,
+          occurredAt: now,
+          ...event(threadId, runId),
+        } as OrchestrationV2DomainEvent,
+      ],
+    });
+  });
+
+const activities: ReadonlyArray<readonly [string, Hook]> = [
+  ["opened", updateThread("opened", "thread.visited", { lastVisitedAt: now })],
+  ["pinned", updateThread("pinned", "thread.pinned", { pinnedAt: now })],
+  [
+    "snoozed",
+    updateThread("snoozed", "thread.snoozed", {
+      snoozedAt: now,
+      snoozedUntil: DateTime.add(now, { days: 1 }),
+    }),
+  ],
+  [
+    "pr-linked",
+    updateThread("pr-linked", "thread.pull-request-synced", { pullRequests: [openPullRequest] }),
+  ],
+  [
+    "messaged",
+    writeActivity("messaged", (threadId, runId) => ({
+      type: "message.updated",
+      payload: {
+        id: MessageId.make("message:messaged:again"),
+        threadId,
+        runId,
+        nodeId: null,
+        role: "user",
+        text: "one more thing",
+        attachments: [],
+        streaming: false,
+        createdBy: "user",
+        creationSource: "web",
+        createdAt: now,
+        updatedAt: now,
+      },
+    })),
+  ],
+  [
+    "run",
+    writeActivity("run", (threadId, runId) => ({
+      type: "run.created",
+      payload: {
+        id: runId,
+        threadId,
+        ordinal: 2,
+        providerInstanceId,
+        modelSelection,
+        providerThreadId: null,
+        userMessageId: MessageId.make("message:run:again"),
+        rootNodeId: NodeId.make("node:run:again"),
+        activeAttemptId: null,
+        status: "queued",
+        requestedAt: now,
+        startedAt: null,
+        completedAt: null,
+        checkpointId: null,
+        contextHandoffId: null,
+      },
+    })),
+  ],
+  [
+    "trimming-off",
+    Effect.flatMap(ServerSettings.ServerSettingsService, (settings) =>
+      settings.updateSettings({ threadHistoryTrimAfterDays: 0 }),
+    ),
+  ],
+];
+
+it.effect.each(activities)(
+  "stops trimming a thread that is %s during the pass",
+  ([name, activity]) =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(now));
+      const { threadId } = yield* seedThread(name);
+      yield* trim;
+      assert.deepEqual(yield* itemTitles(threadId), everyItem);
+    }).pipe(Effect.provide(duringTrim(activity))),
+);
+
+it.effect("stops between pages once the thread is opened", () =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(DateTime.toEpochMillis(now));
+    const { threadId } = yield* seedThread("opened", { extraReasoning: 250 });
+    yield* trim;
+    // The first page of 200 went; the rest stays.
+    assert.lengthOf(yield* itemTitles(threadId), everyItem.length + 250 - 200 + 1);
+  }).pipe(
+    Effect.provide(duringTrim(updateThread("opened", "thread.visited", { lastVisitedAt: now }), 2)),
+  ),
+);
+
+it.effect(
+  "advances the thread's revision so reconnects, windows and search drop trimmed rows",
+  () => {
+    const name = "reconnect";
+    const threadId = ThreadId.make(`thread:trim:${name}`);
+    const removed = [`item:${name}:reasoning`, `item:${name}:command`];
+    let warmed:
+      | { readonly snapshotSequence: number; readonly projection: OrchestrationV2ThreadProjection }
+      | undefined;
+    // A client that read the thread mid-pass, and left the timeline and search caches warm.
+    const read: Hook = Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      warmed = yield* store.getThreadSnapshot(threadId);
+      yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 50 });
+      yield* store.searchThread({ threadId, query: "flaky" });
+    });
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(now));
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const events = yield* EventStore.EventStoreV2;
+      yield* createProject;
+      yield* seedThread(name);
+      yield* trim;
+      const before = warmed!;
+      assert.includeMembers(
+        before.projection.turnItems.map((item) => item.id),
+        removed,
+      );
+
+      const after = yield* store.getThreadSnapshot(threadId);
+      assert.isAbove(after.snapshotSequence, before.snapshotSequence);
+      const ids = (projection: OrchestrationV2ThreadProjection) => ({
+        turnItems: projection.turnItems.map((item) => item.id).toSorted(),
+        nodes: projection.nodes.map((node) => node.id).toSorted(),
+        visible: projection.visibleTurnItems.map((row) => row.sourceItemId),
+      });
+      const replay = yield* Stream.runCollect(
+        events.read({ threadId, afterSequence: before.snapshotSequence }),
+      );
+      const resumed = replay.reduce(
+        (projection, stored) => ProjectionStore.applyToProjection(projection, stored.event),
+        before.projection,
+      );
+      assert.deepEqual(ids(resumed), ids(after.projection));
+      assert.notIncludeMembers(ids(after.projection).turnItems, removed);
+
+      const window = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 50 });
+      assert.equal(window.snapshotSequence, after.snapshotSequence);
+      assert.notIncludeMembers(
+        window.projection.turnItems.map((item) => item.id),
+        removed,
+      );
+      const found = yield* store.searchThread({ threadId, query: "flaky" });
+      assert.equal(found.snapshotSequence, after.snapshotSequence);
+    }).pipe(Effect.provide(duringTrim(read)));
+  },
+);
 
 it.layer(layerTest(0))("ThreadHistoryTrim turned off", (it) => {
   it.effect("removes nothing", () =>

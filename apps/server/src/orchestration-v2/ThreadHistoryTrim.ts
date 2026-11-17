@@ -1,8 +1,11 @@
 import {
+  type NodeId,
+  type OrchestrationV2DomainEvent,
   type RunId,
   type ThreadHistoryTrimReport,
   type ThreadHistoryTrimStatus,
   type ThreadId,
+  type TurnItemId,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
@@ -71,7 +74,9 @@ type Candidate = {
   readonly updatedAt: string;
 };
 type Mode = "background" | "manual";
-type Removed = { readonly itemCount: number; readonly bytes: number };
+
+const sumBytes = (rows: ReadonlyArray<{ readonly bytes: number }>) =>
+  rows.reduce((total, row) => total + row.bytes, 0);
 
 // Space a row gives back: its payload plus each copy of its ids in the row, its indexes and its position row.
 const ITEM_BYTES = `(octet_length(payload_json) + 5 * length(turn_item_id) + 8 * length(thread_id)
@@ -163,7 +168,7 @@ const make = Effect.gen(function* () {
             OR COALESCE(recent.completed_at, '') >= ${input.idleBefore}
           )
       )
-      AND EXISTS (
+      AND (${input.threadId !== undefined} OR EXISTS (
         SELECT 1 FROM orchestration_v2_projection_turn_items AS item
         WHERE item.thread_id = thread.thread_id
           AND item.type IN ${sql.in(TRIMMED_ITEM_TYPES)}
@@ -174,7 +179,7 @@ const make = Effect.gen(function* () {
             SELECT 1 FROM orchestration_v2_projection_turn_items AS child
             WHERE child.thread_id = item.thread_id AND child.parent_item_id = item.turn_item_id
           )
-      )
+      ))
     ORDER BY thread.thread_id ASC
   `;
 
@@ -188,114 +193,12 @@ const make = Effect.gen(function* () {
     };
   });
 
-  const estimate = Effect.fn("ThreadHistoryTrim.estimate")(function* (dryRun: boolean) {
-    const { afterDays, now, idleBefore } = yield* window;
-    const candidates = afterDays <= 0 ? [] : yield* readCandidates({ idleBefore, now });
-    let itemCount = 0;
-    let estimatedBytes = 0;
-    for (const candidate of candidates) {
-      const rows = yield* sql<{ readonly items: number; readonly bytes: number }>`
-        SELECT
-          (SELECT COUNT(*) FROM orchestration_v2_projection_turn_items
-            WHERE thread_id = ${candidate.threadId}
-              AND type IN ${sql.in(TRIMMED_ITEM_TYPES)}
-              AND inline_work_output = 0
-              AND status NOT IN ${sql.in(LIVE_ITEM_STATUSES)}) AS items,
-          COALESCE((SELECT SUM(${sql.literal(ITEM_BYTES)}) FROM orchestration_v2_projection_turn_items
-            WHERE thread_id = ${candidate.threadId}
-              AND type IN ${sql.in(TRIMMED_ITEM_TYPES)}
-              AND inline_work_output = 0
-              AND status NOT IN ${sql.in(LIVE_ITEM_STATUSES)}), 0)
-          + COALESCE((SELECT SUM(${sql.literal(nodeBytes(""))}) FROM orchestration_v2_projection_nodes
-            WHERE thread_id = ${candidate.threadId}
-              AND kind IN ${sql.in(TRIMMED_NODE_KINDS)}
-              AND status NOT IN ${sql.in(LIVE_NODE_STATUSES)}), 0) AS bytes
-      `;
-      itemCount += rows[0]?.items ?? 0;
-      estimatedBytes += rows[0]?.bytes ?? 0;
-      yield* Effect.yieldNow;
-    }
-    return {
-      dryRun,
-      afterDays,
-      threadCount: candidates.length,
-      itemCount,
-      estimatedBytes,
-    } satisfies ThreadHistoryTrimReport;
-  });
-
-  const writeNotice = Effect.fn("ThreadHistoryTrim.writeNotice")(function* (
-    candidate: Candidate,
-    afterDays: number,
-  ) {
-    const now = yield* DateTime.now;
-    yield* eventSink.write({
-      events: [
-        {
-          id: yield* ids.allocate.event({ threadId: candidate.threadId }),
-          type: "turn-item.updated",
-          threadId: candidate.threadId,
-          runId: candidate.runId,
-          // Every event stamps the thread with its time; reusing the thread's own keeps a trimmed
-          // thread where it was in lists sorted by activity.
-          occurredAt: DateTime.makeUnsafe(candidate.updatedAt),
-          payload: {
-            id: ids.derive.runSignalTurnItem({ runId: candidate.runId, signal: NOTICE_SIGNAL }),
-            threadId: candidate.threadId,
-            runId: candidate.runId,
-            nodeId: null,
-            providerThreadId: null,
-            providerTurnId: null,
-            nativeItemRef: null,
-            parentItemId: null,
-            // EventSink allocates the real position, after the run's existing items.
-            ordinal: 0,
-            status: "completed",
-            title: "Older detail was trimmed",
-            startedAt: now,
-            completedAt: now,
-            updatedAt: now,
-            type: "system_notice",
-            message: trimNoticeMessage(afterDays),
-          },
-        },
-      ],
-    });
-  });
-
-  const deleteInPages = Effect.fnUntraced(function* <E>(
-    rowIds: ReadonlyArray<string>,
-    deletePage: (page: ReadonlyArray<string>) => Effect.Effect<unknown, E>,
-    rest: Effect.Effect<void>,
-  ) {
-    for (let offset = 0; offset < rowIds.length; offset += DELETE_PAGE_SIZE) {
-      yield* deletePage(rowIds.slice(offset, offset + DELETE_PAGE_SIZE));
-      // Never hold the writer across a rest: foreground commits run between pages.
-      yield* rest;
-    }
-  });
-
-  const trimThread = Effect.fn("ThreadHistoryTrim.trimThread")(function* (
-    candidate: Candidate,
-    afterDays: number,
-    rest: Effect.Effect<void>,
-  ) {
+  const select = Effect.fn("ThreadHistoryTrim.select")(function* (candidate: Candidate) {
     const { threadId } = candidate;
-    const noticeId = ids.derive.runSignalTurnItem({
-      runId: candidate.runId,
-      signal: NOTICE_SIGNAL,
-    });
-    const readBoundary = sql<{ readonly ordinal: number }>`
-      SELECT ordinal FROM orchestration_v2_projection_turn_items WHERE turn_item_id = ${noticeId}
-    `;
-    // The notice goes first: a pass that stops halfway leaves a marked thread the next pass finishes.
-    if ((yield* readBoundary)[0] === undefined) yield* writeNotice(candidate, afterDays);
-    const boundary = (yield* readBoundary)[0]?.ordinal;
-    if (boundary === undefined) return { itemCount: 0, bytes: 0 } satisfies Removed;
-
     const items = yield* sql<{
       readonly id: string;
       readonly parent: string | null;
+      readonly node: string | null;
       readonly type: string;
       readonly status: string;
       readonly inline: number;
@@ -304,13 +207,14 @@ const make = Effect.gen(function* () {
       SELECT
         turn_item_id AS id,
         parent_item_id AS parent,
+        node_id AS node,
         type,
         status,
         inline_work_output AS inline,
         ${sql.literal(ITEM_BYTES)} AS bytes
       FROM orchestration_v2_projection_turn_items
-      WHERE thread_id = ${threadId} AND ordinal < ${boundary}
-    `.pipe(NodeSqliteClient.readOnlyBackground);
+      WHERE thread_id = ${threadId}
+    `;
     const trimmedItemTypes: ReadonlyArray<string> = TRIMMED_ITEM_TYPES;
     const liveItemStatuses: ReadonlyArray<string> = LIVE_ITEM_STATUSES;
     const removedItems = unreferenced(
@@ -321,25 +225,7 @@ const make = Effect.gen(function* () {
         !liveItemStatuses.includes(item.status),
       [],
     );
-    yield* deleteInPages(
-      removedItems.map((item) => item.id),
-      (page) =>
-        sql.withTransaction(
-          Effect.gen(function* () {
-            yield* sql`
-              DELETE FROM orchestration_v2_projection_turn_items
-              WHERE turn_item_id IN ${sql.in(page)}
-                AND status NOT IN ${sql.in(LIVE_ITEM_STATUSES)}
-                AND inline_work_output = 0
-            `;
-            yield* sql`
-              DELETE FROM orchestration_v2_turn_item_positions
-              WHERE thread_id = ${threadId} AND turn_item_id IN ${sql.in(page)}
-            `;
-          }),
-        ),
-      rest,
-    );
+    const removedItemIds = new Set(removedItems.map((item) => item.id));
 
     const nodes = yield* sql<{
       readonly id: string;
@@ -359,11 +245,9 @@ const make = Effect.gen(function* () {
       FROM orchestration_v2_projection_nodes AS node
       LEFT JOIN orchestration_v2_projection_runs AS run ON run.run_id = node.run_id
       WHERE node.thread_id = ${threadId}
-    `.pipe(NodeSqliteClient.readOnlyBackground);
+    `;
     const referencedNodes = yield* sql<{ readonly id: string }>`
-      SELECT node_id AS id FROM orchestration_v2_projection_turn_items
-        WHERE thread_id = ${threadId} AND node_id IS NOT NULL
-      UNION SELECT node_id FROM orchestration_v2_projection_messages
+      SELECT node_id AS id FROM orchestration_v2_projection_messages
         WHERE thread_id = ${threadId} AND node_id IS NOT NULL
       UNION SELECT node_id FROM orchestration_v2_projection_plans
         WHERE thread_id = ${threadId} AND node_id IS NOT NULL
@@ -381,7 +265,7 @@ const make = Effect.gen(function* () {
         WHERE thread_id = ${threadId} AND root_node_id IS NOT NULL
       UNION SELECT owner_node_id FROM orchestration_v2_projection_provider_threads
         WHERE thread_id = ${threadId} AND owner_node_id IS NOT NULL
-    `.pipe(NodeSqliteClient.readOnlyBackground);
+    `;
     const trimmedNodeKinds: ReadonlyArray<string> = TRIMMED_NODE_KINDS;
     const liveNodeStatuses: ReadonlyArray<string> = LIVE_NODE_STATUSES;
     const removedNodes = unreferenced(
@@ -390,23 +274,168 @@ const make = Effect.gen(function* () {
         node.settled === 1 &&
         trimmedNodeKinds.includes(node.kind) &&
         !liveNodeStatuses.includes(node.status),
-      referencedNodes.map((row) => row.id),
+      [
+        ...items.flatMap((item) =>
+          item.node === null || removedItemIds.has(item.id) ? [] : [item.node],
+        ),
+        ...referencedNodes.map((row) => row.id),
+      ],
     );
-    yield* deleteInPages(
-      removedNodes.map((node) => node.id),
-      (page) => sql`
-        DELETE FROM orchestration_v2_projection_nodes
-        WHERE node_id IN ${sql.in(page)} AND status NOT IN ${sql.in(LIVE_NODE_STATUSES)}
-      `,
-      rest,
-    );
+    return { items: removedItems, nodes: removedNodes };
+  });
 
-    const bytes = (rows: ReadonlyArray<{ readonly bytes: number }>) =>
-      rows.reduce((total, row) => total + row.bytes, 0);
+  const estimate = Effect.fn("ThreadHistoryTrim.estimate")(function* (dryRun: boolean) {
+    const { afterDays, now, idleBefore } = yield* window;
+    const candidates = afterDays <= 0 ? [] : yield* readCandidates({ idleBefore, now });
+    let itemCount = 0;
+    let estimatedBytes = 0;
+    for (const candidate of candidates) {
+      const selection = yield* select(candidate);
+      itemCount += selection.items.length;
+      estimatedBytes += sumBytes(selection.items) + sumBytes(selection.nodes);
+      yield* Effect.yieldNow;
+    }
     return {
-      itemCount: removedItems.length,
-      bytes: bytes(removedItems) + bytes(removedNodes),
-    } satisfies Removed;
+      dryRun,
+      afterDays,
+      threadCount: candidates.length,
+      itemCount,
+      estimatedBytes,
+    } satisfies ThreadHistoryTrimReport;
+  });
+
+  const noticeEvent = Effect.fn("ThreadHistoryTrim.noticeEvent")(function* (
+    candidate: Candidate,
+    afterDays: number,
+  ) {
+    const now = yield* DateTime.now;
+    return {
+      id: yield* ids.allocate.event({ threadId: candidate.threadId }),
+      type: "turn-item.updated",
+      threadId: candidate.threadId,
+      runId: candidate.runId,
+      // Every event stamps the thread with its time; reusing the thread's own keeps a trimmed
+      // thread where it was in lists sorted by activity.
+      occurredAt: DateTime.makeUnsafe(candidate.updatedAt),
+      payload: {
+        id: ids.derive.runSignalTurnItem({ runId: candidate.runId, signal: NOTICE_SIGNAL }),
+        threadId: candidate.threadId,
+        runId: candidate.runId,
+        nodeId: null,
+        providerThreadId: null,
+        providerTurnId: null,
+        nativeItemRef: null,
+        parentItemId: null,
+        // EventSink allocates the real position, after the run's existing items.
+        ordinal: 0,
+        status: "completed",
+        title: "Older detail was trimmed",
+        startedAt: now,
+        completedAt: now,
+        updatedAt: now,
+        type: "system_notice",
+        message: trimNoticeMessage(afterDays),
+      },
+    } satisfies OrchestrationV2DomainEvent;
+  });
+
+  /** Removes one page in a transaction that first confirms the thread is still idle and trimming on. */
+  const trimPage = Effect.fn("ThreadHistoryTrim.trimPage")(function* (
+    threadId: ThreadId,
+    page: { readonly itemIds: ReadonlyArray<string>; readonly nodeIds: ReadonlyArray<string> },
+  ) {
+    // Assigned inside the transaction, which narrowing cannot see.
+    let outcome = "trimmed" as "trimmed" | "thread-in-use" | "trimming-off";
+    let removed: { readonly itemIds: ReadonlySet<string>; readonly nodeIds: ReadonlySet<string> } =
+      {
+        itemIds: new Set(),
+        nodeIds: new Set(),
+      };
+    yield* eventSink.writeBuilt(
+      Effect.gen(function* () {
+        const { afterDays, now, idleBefore } = yield* window;
+        if (afterDays <= 0) {
+          outcome = "trimming-off";
+          return [];
+        }
+        const current = (yield* readCandidates({ idleBefore, now, threadId }))[0];
+        if (current === undefined) {
+          outcome = "thread-in-use";
+          return [];
+        }
+        const itemRows =
+          page.itemIds.length === 0
+            ? []
+            : yield* sql<{ readonly id: TurnItemId }>`
+                SELECT turn_item_id AS id FROM orchestration_v2_projection_turn_items
+                WHERE thread_id = ${threadId} AND turn_item_id IN ${sql.in(page.itemIds)}
+                  AND status NOT IN ${sql.in(LIVE_ITEM_STATUSES)} AND inline_work_output = 0
+              `;
+        const nodeRows =
+          page.nodeIds.length === 0
+            ? []
+            : yield* sql<{ readonly id: NodeId }>`
+                SELECT node_id AS id FROM orchestration_v2_projection_nodes
+                WHERE thread_id = ${threadId} AND node_id IN ${sql.in(page.nodeIds)}
+                  AND status NOT IN ${sql.in(LIVE_NODE_STATUSES)}
+              `;
+        if (itemRows.length === 0 && nodeRows.length === 0) return [];
+        removed = {
+          itemIds: new Set(itemRows.map((row) => row.id)),
+          nodeIds: new Set(nodeRows.map((row) => row.id)),
+        };
+        const noticeId = ids.derive.runSignalTurnItem({
+          runId: current.runId,
+          signal: NOTICE_SIGNAL,
+        });
+        const noticed = yield* sql`
+          SELECT 1 FROM orchestration_v2_projection_turn_items WHERE turn_item_id = ${noticeId}
+        `;
+        const events: Array<OrchestrationV2DomainEvent> =
+          noticed.length === 0 ? [yield* noticeEvent(current, afterDays)] : [];
+        events.push({
+          id: yield* ids.allocate.event({ threadId }),
+          type: "thread.history-trimmed",
+          threadId,
+          occurredAt: DateTime.makeUnsafe(current.updatedAt),
+          payload: {
+            turnItemIds: itemRows.map((row) => row.id),
+            nodeIds: nodeRows.map((row) => row.id),
+          },
+        });
+        return events;
+      }),
+    );
+    return { outcome, removed };
+  });
+
+  const trimThread = Effect.fn("ThreadHistoryTrim.trimThread")(function* (
+    candidate: Candidate,
+    rest: Effect.Effect<void>,
+  ) {
+    const selection = yield* select(candidate).pipe(NodeSqliteClient.readOnlyBackground);
+    const rows = [
+      ...selection.items.map((row) => ({ ...row, kind: "item" as const })),
+      ...selection.nodes.map((row) => ({ ...row, kind: "node" as const })),
+    ];
+    let itemCount = 0;
+    let bytes = 0;
+    for (let offset = 0; offset < rows.length; offset += DELETE_PAGE_SIZE) {
+      const page = rows.slice(offset, offset + DELETE_PAGE_SIZE);
+      const { outcome, removed } = yield* trimPage(candidate.threadId, {
+        itemIds: page.flatMap((row) => (row.kind === "item" ? [row.id] : [])),
+        nodeIds: page.flatMap((row) => (row.kind === "node" ? [row.id] : [])),
+      });
+      if (outcome !== "trimmed") return { outcome, itemCount, bytes };
+      for (const row of page) {
+        if (!(row.kind === "item" ? removed.itemIds : removed.nodeIds).has(row.id)) continue;
+        if (row.kind === "item") itemCount += 1;
+        bytes += row.bytes;
+      }
+      // Never hold the writer across a rest: foreground commits run between pages.
+      yield* rest;
+    }
+    return { outcome: "trimmed" as const, itemCount, bytes };
   });
 
   const readLastPass = sql<{ readonly updated_at: string }>`
@@ -470,7 +499,7 @@ const make = Effect.gen(function* () {
       const current = yield* readCandidates({ idleBefore, now, threadId: listed.threadId });
       const candidate = current[0];
       if (candidate === undefined) continue;
-      const removed = yield* trimThread(candidate, afterDays, rest).pipe(
+      const removed = yield* trimThread(candidate, rest).pipe(
         Effect.catchCauseIf(
           (cause) => !Cause.hasInterruptsOnly(cause),
           (cause) =>
@@ -481,6 +510,8 @@ const make = Effect.gen(function* () {
         ),
       );
       if (removed === null) continue;
+      if (removed.outcome === "trimming-off") return;
+      if (removed.itemCount === 0 && removed.bytes === 0) continue;
       threadCount += 1;
       itemCount += removed.itemCount;
       estimatedBytes += removed.bytes;

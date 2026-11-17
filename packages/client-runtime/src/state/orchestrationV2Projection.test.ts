@@ -583,7 +583,7 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
     expect(visibleIds(apply(bounded, [failed], partial))).toEqual([reply.id]);
   });
 
-  it("removes only hidden local items while preserving inherited rows", () => {
+  it("removes only hidden or trimmed local items while preserving inherited rows", () => {
     const inherited = commandItem("item-inherited");
     const local = commandItem("item-local");
     const inheritedRow = {
@@ -618,6 +618,16 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
     const next = applyOrchestrationV2ProjectionEvent(projection, event);
     expect(next?.visibleTurnItems).toEqual([inheritedRow]);
     expect(next?.visibleTurnItems[0]).toBe(inheritedRow);
+
+    const trimmed = applyOrchestrationV2ProjectionEvent(projection, {
+      id: "event-history-trimmed",
+      type: "thread.history-trimmed",
+      threadId,
+      occurredAt: now,
+      payload: { turnItemIds: [local.id, inherited.id], nodeIds: [] },
+    } as OrchestrationV2DomainEvent);
+    expect(trimmed?.turnItems).toEqual([]);
+    expect(trimmed?.visibleTurnItems).toEqual([inheritedRow]);
   });
 });
 

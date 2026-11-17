@@ -1102,6 +1102,18 @@ export function applyToProjection(
         ...projection,
         thread: event.payload,
       };
+    case "thread.history-trimmed": {
+      const items = new Set<string>(event.payload.turnItemIds);
+      const nodes = new Set<string>(event.payload.nodeIds);
+      return {
+        ...projection,
+        turnItems: projection.turnItems.filter((item) => !items.has(item.id)),
+        nodes: projection.nodes.filter((node) => !nodes.has(node.id)),
+        visibleTurnItems: projection.visibleTurnItems
+          .filter((row) => row.sourceThreadId !== event.threadId || !items.has(row.sourceItemId))
+          .map((row, position) => (row.position === position ? row : { ...row, position })),
+      };
+    }
     case "thread.visit-recorded":
       return {
         ...projection,
@@ -3337,6 +3349,26 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             }
             case "checkpoint.rollback-requested":
               break;
+            case "thread.history-trimmed": {
+              const { turnItemIds, nodeIds } = event.payload;
+              if (turnItemIds.length > 0) {
+                yield* sql`
+                  DELETE FROM orchestration_v2_projection_turn_items
+                  WHERE thread_id = ${event.threadId} AND turn_item_id IN ${sql.in(turnItemIds)}
+                `;
+                yield* sql`
+                  DELETE FROM orchestration_v2_turn_item_positions
+                  WHERE thread_id = ${event.threadId} AND turn_item_id IN ${sql.in(turnItemIds)}
+                `;
+              }
+              if (nodeIds.length > 0) {
+                yield* sql`
+                  DELETE FROM orchestration_v2_projection_nodes
+                  WHERE thread_id = ${event.threadId} AND node_id IN ${sql.in(nodeIds)}
+                `;
+              }
+              break;
+            }
             case "context-handoff.updated": {
               const payloadJson = yield* encodeContextHandoffPayload(event.payload);
               const payload = parseEncodedPayload(payloadJson);

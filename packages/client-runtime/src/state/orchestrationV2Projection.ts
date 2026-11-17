@@ -330,6 +330,20 @@ export function applyOrchestrationV2ProjectionEvent(
         ...projection,
         thread: applyOrchestrationV2ThreadVisit(projection.thread, event.payload),
       };
+    case "thread.history-trimmed": {
+      const items = new Set<string>(event.payload.turnItemIds);
+      const nodes = new Set<string>(event.payload.nodeIds);
+      return {
+        ...projection,
+        turnItems: projection.turnItems.filter((item) => !items.has(item.id)),
+        nodes: projection.nodes.filter((node) => !nodes.has(node.id)),
+        visibleTurnItems: renumberVisibleItems(
+          projection.visibleTurnItems.filter(
+            (row) => row.sourceThreadId !== projection.thread.id || !items.has(row.sourceItemId),
+          ),
+        ),
+      };
+    }
     case "run.created":
     case "run.updated": {
       const next = { ...base, runs: upsertEntity(base.runs, event.payload) };
