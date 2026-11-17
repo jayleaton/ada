@@ -16,6 +16,7 @@ import * as PushRegistrations from "./push/PushRegistrations.ts";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Base64 from "effect/encoding/Base64";
+import * as Arr from "effect/Array";
 import * as Effect from "effect/Effect";
 import * as NodeHttpServerRequest from "@effect/platform-node/NodeHttpServerRequest";
 import * as Fiber from "effect/Fiber";
@@ -856,16 +857,29 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
           Stream.map(threadStreamEventItem),
           coalesceThreadLiveStream,
           // Rows this fork inherits were trimmed at their source: send what it shows now.
-          Stream.mapEffect(
+          // Per array, so an ordinary batch passes through as one message.
+          Stream.mapArrayEffect(
             (
-              item,
+              items,
             ): Effect.Effect<
-              OrchestrationV2ThreadStreamItem,
+              Arr.NonEmptyReadonlyArray<OrchestrationV2ThreadStreamItem>,
               OrchestrationV2GetThreadProjectionError
-            > =>
-              item.kind === "event" && invalidatesInheritedRows(item.event, input.threadId)
-                ? loadSnapshotItem()
-                : Effect.succeed(item),
+            > => {
+              const invalidates = (item: OrchestrationV2ThreadStreamItem) =>
+                item.kind === "event" && invalidatesInheritedRows(item.event, input.threadId);
+              if (!items.some(invalidates)) return Effect.succeed(items);
+              return Effect.forEach(
+                items,
+                (
+                  item,
+                ): Effect.Effect<
+                  OrchestrationV2ThreadStreamItem,
+                  OrchestrationV2GetThreadProjectionError
+                > => (invalidates(item) ? loadSnapshotItem() : Effect.succeed(item)),
+              ).pipe(
+                Effect.map((mapped) => (Arr.isReadonlyArrayNonEmpty(mapped) ? mapped : items)),
+              );
+            },
           ),
           Stream.mapError(
             (cause) =>
