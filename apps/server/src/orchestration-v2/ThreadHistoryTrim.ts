@@ -1,7 +1,6 @@
 import {
   type NodeId,
   type OrchestrationV2DomainEvent,
-  type OrchestrationV2TurnItem,
   type RunId,
   type ThreadHistoryTrimReport,
   type ThreadHistoryTrimStatus,
@@ -27,7 +26,6 @@ import * as ServerSettingsModule from "../serverSettings.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
-import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
 export class ThreadHistoryTrimError extends Schema.TaggedError<ThreadHistoryTrimError>()(
   "ThreadHistoryTrimError",
@@ -149,7 +147,6 @@ const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const settingsService = yield* ServerSettingsModule.ServerSettingsService;
-  const positions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
 
   // A subagent has no user of its own, so it ages with the thread that started it.
   const readCandidates = (input: {
@@ -248,18 +245,18 @@ const make = Effect.gen(function* () {
       WHERE thread_id = ${threadId} AND owner_node_id IS NOT NULL
   `;
 
-  // Forks that show this thread's rows, through any depth of forking; side chats inherit none.
+  // Live forks that show this thread's rows, at any depth; a deleted fork still passes them on.
   const readForks = (threadId: ThreadId) => sql<{ readonly id: ThreadId }>`
-    WITH RECURSIVE forks(thread_id) AS (
-      SELECT ${threadId}
+    WITH RECURSIVE forks(thread_id, deleted) AS (
+      SELECT ${threadId}, 0
       UNION
-      SELECT fork.thread_id FROM orchestration_v2_projection_threads AS fork
+      SELECT fork.thread_id, fork.deleted_at IS NOT NULL
+      FROM orchestration_v2_projection_threads AS fork
       JOIN forks ON json_extract(fork.payload_json, '$.forkedFrom.threadId') = forks.thread_id
       WHERE json_extract(fork.payload_json, '$.forkedFrom.type') = 'run'
         AND COALESCE(json_extract(fork.payload_json, '$.lineage.sideChat'), 0) = 0
-        AND fork.deleted_at IS NULL
     )
-    SELECT thread_id AS id FROM forks WHERE thread_id <> ${threadId}
+    SELECT thread_id AS id FROM forks WHERE thread_id <> ${threadId} AND deleted = 0
   `;
 
   const select = Effect.fn("ThreadHistoryTrim.select")(function* (candidate: Candidate) {
@@ -489,29 +486,28 @@ const make = Effect.gen(function* () {
         const noticed = yield* sql`
           SELECT 1 FROM orchestration_v2_projection_turn_items WHERE turn_item_id = ${noticeId}
         `;
-        const events: Array<OrchestrationV2DomainEvent> = [];
-        let notice: OrchestrationV2TurnItem | undefined;
-        if (noticed.length === 0) {
-          const event = yield* noticeEvent(current, afterDays);
-          // Placed here rather than by EventSink, so forks get the position the source shows.
-          notice = yield* positions.normalize(event.payload, current.runOrdinal);
-          events.push({ ...event, payload: notice });
-        }
-        const payload = {
-          sourceThreadId: threadId,
-          turnItemIds: itemIds.flatMap((row) => (items.has(row.id) ? [row.id] : [])),
-          nodeIds: nodeIds.flatMap((row) => (nodes.has(row.id) ? [row.id] : [])),
-          ...(notice === undefined ? {} : { notice }),
-        };
+        const events: Array<OrchestrationV2DomainEvent> =
+          noticed.length === 0 ? [yield* noticeEvent(current, afterDays)] : [];
         const occurredAt = yield* DateTime.now;
-        // Each fork gets its own copy, so its revision moves with the rows it inherits.
-        for (const target of [threadId, ...(yield* readForks(threadId)).map((row) => row.id)]) {
+        events.push({
+          id: yield* ids.allocate.event({ threadId }),
+          type: "thread.history-trimmed",
+          threadId,
+          occurredAt,
+          payload: {
+            sourceThreadId: threadId,
+            turnItemIds: itemIds.flatMap((row) => (items.has(row.id) ? [row.id] : [])),
+            nodeIds: nodeIds.flatMap((row) => (nodes.has(row.id) ? [row.id] : [])),
+          },
+        });
+        // Each fork's revision moves with the rows it inherits; its copy stays a few bytes.
+        for (const { id: fork } of yield* readForks(threadId)) {
           events.push({
-            id: yield* ids.allocate.event({ threadId: target }),
+            id: yield* ids.allocate.event({ threadId: fork }),
             type: "thread.history-trimmed",
-            threadId: target,
+            threadId: fork,
             occurredAt,
-            payload,
+            payload: { sourceThreadId: threadId, turnItemIds: [], nodeIds: [] },
           });
         }
         return events;
@@ -671,6 +667,4 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(ThreadHistoryTrim, make).pipe(
-  Layer.provide(TurnItemPositionStore.layer),
-);
+export const layer = Layer.effect(ThreadHistoryTrim, make);

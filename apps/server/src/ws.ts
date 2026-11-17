@@ -153,6 +153,7 @@ import {
 import {
   buildBoundedThreadStreamSnapshot,
   decideThreadResume,
+  invalidatesInheritedRows,
   isThreadReplayRawPayloadSafe,
   threadReplayEncodedBytes,
   THREAD_RESUME_MAX_REPLAY_EVENTS,
@@ -854,6 +855,18 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         .pipe(
           Stream.map(threadStreamEventItem),
           coalesceThreadLiveStream,
+          // Rows this fork inherits were trimmed at their source: send what it shows now.
+          Stream.mapEffect(
+            (
+              item,
+            ): Effect.Effect<
+              OrchestrationV2ThreadStreamItem,
+              OrchestrationV2GetThreadProjectionError
+            > =>
+              item.kind === "event" && invalidatesInheritedRows(item.event, input.threadId)
+                ? loadSnapshotItem()
+                : Effect.succeed(item),
+          ),
           Stream.mapError(
             (cause) =>
               new OrchestrationV2GetThreadProjectionError({
@@ -897,7 +910,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         ? Stream.make({ kind: "synchronized" as const })
         : Stream.empty;
 
-    const snapshotThenLive = Effect.fn("ws.orchestrationV2.threadSnapshotThenLive")(function* () {
+    const loadSnapshotItem = Effect.fn("ws.orchestrationV2.loadThreadSnapshotItem")(function* () {
       const useBoundedSnapshot = shouldUseBoundedThreadSnapshot(input);
       const snapshot = yield* (
         useBoundedSnapshot
@@ -933,9 +946,13 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
               projection: dedupeBodies ? dedupeSnapshotBodies(projection) : projection,
             };
           })();
+      return snapshotItem;
+    });
+    const snapshotThenLive = Effect.fn("ws.orchestrationV2.threadSnapshotThenLive")(function* () {
+      const snapshotItem = yield* loadSnapshotItem();
       return rpcInitialItems([snapshotItem]).pipe(
         Stream.concat(completionMarker),
-        Stream.concat(eventStreamFrom(snapshotSequence)),
+        Stream.concat(eventStreamFrom(snapshotItem.snapshotSequence)),
         withLiveDedupe,
       );
     });
@@ -1026,6 +1043,13 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         return yield* snapshotThenLive();
       }
       const replay = coalesceLiveUpdatedEvents(replayed);
+      if (
+        replay.some(
+          (item) => item.kind === "event" && invalidatesInheritedRows(item.event, input.threadId),
+        )
+      ) {
+        return yield* snapshotThenLive();
+      }
       const plan = decideThreadResume({
         afterSequence: input.afterSequence,
         highWater,

@@ -34,7 +34,7 @@ import * as EventStore from "./EventStore.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ThreadHistoryTrim from "./ThreadHistoryTrim.ts";
-import { buildBoundedThreadStreamSnapshot } from "./ThreadStream.ts";
+import { buildBoundedThreadStreamSnapshot, invalidatesInheritedRows } from "./ThreadStream.ts";
 
 const database = SqlitePersistence.layerMemory;
 const stores = Layer.mergeAll(
@@ -685,7 +685,8 @@ const midPassReader = (threadId: ThreadId) => {
     yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 50 });
     yield* store.searchThread({ threadId, query: "flaky" });
   });
-  const verify = (removed: Array<string>) =>
+  /** A fork's replay holds compact copies, which subscribers answer with a fresh snapshot. */
+  const verify = (removed: Array<string>, fork = false) =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
       const before = warmed!;
@@ -698,11 +699,19 @@ const midPassReader = (threadId: ThreadId) => {
       const replay = yield* Stream.runCollect(
         (yield* EventStore.EventStoreV2).read({ threadId, afterSequence: before.snapshotSequence }),
       );
-      const resumed = replay.reduce(
-        (projection, stored) => ProjectionStore.applyToProjection(projection, stored.event),
-        before.projection,
-      );
-      assert.deepEqual(ids(resumed), ids(after.projection));
+      if (fork) {
+        const copies = replay.filter((stored) => invalidatesInheritedRows(stored.event, threadId));
+        assert.isNotEmpty(copies);
+        for (const copy of copies) {
+          assert.isAtMost(JSON.stringify(copy.event.payload).length, 128);
+        }
+      } else {
+        const resumed = replay.reduce(
+          (projection, stored) => ProjectionStore.applyToProjection(projection, stored.event),
+          before.projection,
+        );
+        assert.deepEqual(ids(resumed), ids(after.projection));
+      }
 
       const window = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 50 });
       assert.equal(window.snapshotSequence, after.snapshotSequence);
@@ -807,25 +816,38 @@ it.layer(hookedFixture)("ThreadHistoryTrim during a pass", (it) => {
       }),
   );
 
-  it.effect("advances an active fork's revision when the rows it inherits are trimmed", () =>
+  it.effect("advances the revision of every live fork, through deleted forks, compactly", () =>
     Effect.gen(function* () {
       yield* isolate;
       const source = yield* seedThread("fork-source");
-      const fork = yield* seedThread("fork", {
-        userMessageAt: recent,
-        thread: {
-          lineage: {
-            parentThreadId: source.threadId,
-            relationshipToParent: "fork",
-            rootThreadId: source.threadId,
+      const forkOf = (name: string, parent: { threadId: ThreadId; runId: RunId }) =>
+        seedThread(name, {
+          userMessageAt: recent,
+          thread: {
+            lineage: {
+              parentThreadId: parent.threadId,
+              relationshipToParent: "fork",
+              rootThreadId: source.threadId,
+            },
+            forkedFrom: { type: "run", threadId: parent.threadId, runId: parent.runId },
           },
-          forkedFrom: { type: "run", threadId: source.threadId, runId: source.runId },
-        },
-      });
-      const reader = midPassReader(fork.threadId);
-      yield* arm(reader.read);
+        });
+      const fork = yield* forkOf("fork", source);
+      const deleted = yield* forkOf("deleted-fork", source);
+      const grandchild = yield* forkOf("fork-of-deleted", deleted);
+      yield* updateThread("deleted-fork", "thread.deleted", { deletedAt: now });
+      const deletedEvents = Stream.runCollect(
+        (yield* EventStore.EventStoreV2).read({ threadId: deleted.threadId }),
+      );
+      const deletedBefore = (yield* deletedEvents).length;
+
+      const readers = [midPassReader(grandchild.threadId), midPassReader(fork.threadId)];
+      yield* arm(Effect.forEach(readers, (reader) => reader.read, { discard: true }));
       yield* trim;
-      yield* reader.verify(["item:fork-source:reasoning", "item:fork-source:command"]);
+      for (const reader of readers) {
+        yield* reader.verify(["item:fork-source:reasoning", "item:fork-source:command"], true);
+      }
+      assert.lengthOf(yield* deletedEvents, deletedBefore);
       assert.deepEqual(yield* itemTitles(fork.threadId), everyItem);
     }),
   );

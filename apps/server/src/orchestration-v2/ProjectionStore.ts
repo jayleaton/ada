@@ -1046,27 +1046,6 @@ export function emptyProjection(
   };
 }
 
-/** A fork shows its source's trim notice after the last row it inherits from the notice's run. */
-function withInheritedNotice(
-  rows: OrchestrationV2ThreadProjection["visibleTurnItems"],
-  notice: OrchestrationV2TurnItem | undefined,
-  sourceThreadId: ThreadId,
-): OrchestrationV2ThreadProjection["visibleTurnItems"] {
-  if (notice === undefined || rows.some((row) => row.sourceItemId === notice.id)) return rows;
-  const after = rows.findLastIndex(
-    (row) => row.sourceThreadId === sourceThreadId && row.item.runId === notice.runId,
-  );
-  if (after === -1) return rows;
-  const row = {
-    position: 0,
-    visibility: "inherited" as const,
-    sourceThreadId,
-    sourceItemId: notice.id,
-    item: notice,
-  };
-  return [...rows.slice(0, after + 1), row, ...rows.slice(after + 1)];
-}
-
 export function applyToProjection(
   projection: OrchestrationV2ThreadProjection,
   event: OrchestrationV2DomainEvent,
@@ -1124,22 +1103,16 @@ export function applyToProjection(
         thread: event.payload,
       };
     case "thread.history-trimmed": {
-      const { sourceThreadId } = event.payload;
+      if (event.payload.sourceThreadId !== event.threadId) return projection;
       const items = new Set<string>(event.payload.turnItemIds);
-      const nodes = new Set<string>(sourceThreadId === event.threadId ? event.payload.nodeIds : []);
+      const nodes = new Set<string>(event.payload.nodeIds);
       return {
         ...projection,
-        turnItems: projection.turnItems.filter(
-          (item) => item.threadId !== sourceThreadId || !items.has(item.id),
-        ),
+        turnItems: projection.turnItems.filter((item) => !items.has(item.id)),
         nodes: projection.nodes.filter((node) => !nodes.has(node.id)),
-        visibleTurnItems: withInheritedNotice(
-          projection.visibleTurnItems.filter(
-            (row) => row.sourceThreadId !== sourceThreadId || !items.has(row.sourceItemId),
-          ),
-          sourceThreadId === event.threadId ? undefined : event.payload.notice,
-          sourceThreadId,
-        ).map((row, position) => (row.position === position ? row : { ...row, position })),
+        visibleTurnItems: projection.visibleTurnItems
+          .filter((row) => row.sourceThreadId !== event.threadId || !items.has(row.sourceItemId))
+          .map((row, position) => (row.position === position ? row : { ...row, position })),
       };
     }
     case "thread.visit-recorded":
