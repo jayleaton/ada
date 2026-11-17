@@ -625,7 +625,7 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
       threadId,
       occurredAt: now,
       payload: { turnItemIds: [local.id, inherited.id], nodeIds: [] },
-    } as OrchestrationV2DomainEvent);
+    } as unknown as OrchestrationV2DomainEvent);
     expect(trimmed?.turnItems).toEqual([]);
     expect(trimmed?.visibleTurnItems).toEqual([inheritedRow]);
   });

@@ -1,6 +1,7 @@
 import { assert, it } from "@effect/vitest";
 import {
   EventId,
+  ServerSettingsError,
   MessageId,
   NodeId,
   type OrchestrationV2AppThread,
@@ -484,7 +485,7 @@ it.layer(layerTest(30))("ThreadHistoryTrim", (it) => {
 
 type Hook = Effect.Effect<
   void,
-  unknown,
+  EventSink.EventSinkV2Error | ProjectionStore.ProjectionStoreV2Error | ServerSettingsError,
   | EventSink.EventSinkV2
   | EventStore.EventStoreV2
   | ProjectionStore.ProjectionStoreV2
