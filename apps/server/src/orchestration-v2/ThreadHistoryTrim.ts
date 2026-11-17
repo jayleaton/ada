@@ -1,6 +1,7 @@
 import {
   type NodeId,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2TurnItem,
   type RunId,
   type ThreadHistoryTrimReport,
   type ThreadHistoryTrimStatus,
@@ -26,6 +27,7 @@ import * as ServerSettingsModule from "../serverSettings.ts";
 import { forkParked } from "../serverActivation.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as TurnItemPositionStore from "./TurnItemPositionStore.ts";
 
 export class ThreadHistoryTrimError extends Schema.TaggedError<ThreadHistoryTrimError>()(
   "ThreadHistoryTrimError",
@@ -93,7 +95,7 @@ function trimNoticeMessage(afterDays: number): string {
   return `Tool output and reasoning above this point were removed to save space after ${afterDays} ${afterDays === 1 ? "day" : "days"} without use. Messages, plans and file changes are kept.`;
 }
 
-/** Ids no kept row points at, following `parent` links so a kept row never loses an ancestor. */
+/** Ids no kept row points at, children first, so a pass that stops early never orphans a row. */
 function unreferenced<Row extends { readonly id: string; readonly parent: string | null }>(
   rows: ReadonlyArray<Row>,
   removable: (row: Row) => boolean,
@@ -109,7 +111,37 @@ function unreferenced<Row extends { readonly id: string; readonly parent: string
   };
   for (const id of referenced) keep(id);
   for (const row of rows) if (!removable(row)) keep(row.id);
-  return rows.filter((row) => !kept.has(row.id));
+  const depth = (row: Row) => {
+    let count = 0;
+    for (let current = row.parent; current !== null; current = byId.get(current)?.parent ?? null)
+      count += 1;
+    return count;
+  };
+  return rows
+    .filter((row) => !kept.has(row.id))
+    .map((row) => ({ row, depth: depth(row) }))
+    .toSorted((left, right) => right.depth - left.depth)
+    .map(({ row }) => row);
+}
+
+/** Drops each id that a row outside `removable` still hangs off, until none does. */
+function withoutParentsOfKept(
+  removable: ReadonlyArray<string>,
+  children: ReadonlyArray<{ readonly id: string; readonly parent: string }>,
+  blocked: Iterable<string>,
+): ReadonlySet<string> {
+  const removed = new Set(removable);
+  for (const id of blocked) removed.delete(id);
+  for (let changed = true; changed;) {
+    changed = false;
+    for (const child of children) {
+      if (removed.has(child.parent) && !removed.has(child.id)) {
+        removed.delete(child.parent);
+        changed = true;
+      }
+    }
+  }
+  return removed;
 }
 
 const make = Effect.gen(function* () {
@@ -117,6 +149,7 @@ const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const ids = yield* IdAllocator.IdAllocatorV2;
   const settingsService = yield* ServerSettingsModule.ServerSettingsService;
+  const positions = yield* TurnItemPositionStore.TurnItemPositionStoreV2;
 
   // A subagent has no user of its own, so it ages with the thread that started it.
   const readCandidates = (input: {
@@ -193,6 +226,42 @@ const make = Effect.gen(function* () {
     };
   });
 
+  // Rows other than turn items and nodes that keep a node.
+  const nodeReferences = (threadId: ThreadId) => sql`
+    SELECT node_id AS id FROM orchestration_v2_projection_messages
+      WHERE thread_id = ${threadId} AND node_id IS NOT NULL
+    UNION SELECT node_id FROM orchestration_v2_projection_plans
+      WHERE thread_id = ${threadId} AND node_id IS NOT NULL
+    UNION SELECT parent_node_id FROM orchestration_v2_projection_subagents
+      WHERE thread_id = ${threadId}
+    UNION SELECT node_id FROM orchestration_v2_projection_runtime_requests
+      WHERE thread_id = ${threadId} AND node_id IS NOT NULL
+    UNION SELECT node_id FROM orchestration_v2_projection_checkpoints
+      WHERE thread_id = ${threadId}
+    UNION SELECT node_id FROM orchestration_v2_projection_checkpoint_scopes
+      WHERE thread_id = ${threadId} AND node_id IS NOT NULL
+    UNION SELECT node_id FROM orchestration_v2_projection_provider_turns
+      WHERE thread_id = ${threadId}
+    UNION SELECT root_node_id FROM orchestration_v2_projection_run_attempts
+      WHERE thread_id = ${threadId} AND root_node_id IS NOT NULL
+    UNION SELECT owner_node_id FROM orchestration_v2_projection_provider_threads
+      WHERE thread_id = ${threadId} AND owner_node_id IS NOT NULL
+  `;
+
+  // Forks that show this thread's rows, through any depth of forking; side chats inherit none.
+  const readForks = (threadId: ThreadId) => sql<{ readonly id: ThreadId }>`
+    WITH RECURSIVE forks(thread_id) AS (
+      SELECT ${threadId}
+      UNION
+      SELECT fork.thread_id FROM orchestration_v2_projection_threads AS fork
+      JOIN forks ON json_extract(fork.payload_json, '$.forkedFrom.threadId') = forks.thread_id
+      WHERE json_extract(fork.payload_json, '$.forkedFrom.type') = 'run'
+        AND COALESCE(json_extract(fork.payload_json, '$.lineage.sideChat'), 0) = 0
+        AND fork.deleted_at IS NULL
+    )
+    SELECT thread_id AS id FROM forks WHERE thread_id <> ${threadId}
+  `;
+
   const select = Effect.fn("ThreadHistoryTrim.select")(function* (candidate: Candidate) {
     const { threadId } = candidate;
     const items = yield* sql<{
@@ -246,26 +315,7 @@ const make = Effect.gen(function* () {
       LEFT JOIN orchestration_v2_projection_runs AS run ON run.run_id = node.run_id
       WHERE node.thread_id = ${threadId}
     `;
-    const referencedNodes = yield* sql<{ readonly id: string }>`
-      SELECT node_id AS id FROM orchestration_v2_projection_messages
-        WHERE thread_id = ${threadId} AND node_id IS NOT NULL
-      UNION SELECT node_id FROM orchestration_v2_projection_plans
-        WHERE thread_id = ${threadId} AND node_id IS NOT NULL
-      UNION SELECT parent_node_id FROM orchestration_v2_projection_subagents
-        WHERE thread_id = ${threadId}
-      UNION SELECT node_id FROM orchestration_v2_projection_runtime_requests
-        WHERE thread_id = ${threadId} AND node_id IS NOT NULL
-      UNION SELECT node_id FROM orchestration_v2_projection_checkpoints
-        WHERE thread_id = ${threadId}
-      UNION SELECT node_id FROM orchestration_v2_projection_checkpoint_scopes
-        WHERE thread_id = ${threadId} AND node_id IS NOT NULL
-      UNION SELECT node_id FROM orchestration_v2_projection_provider_turns
-        WHERE thread_id = ${threadId}
-      UNION SELECT root_node_id FROM orchestration_v2_projection_run_attempts
-        WHERE thread_id = ${threadId} AND root_node_id IS NOT NULL
-      UNION SELECT owner_node_id FROM orchestration_v2_projection_provider_threads
-        WHERE thread_id = ${threadId} AND owner_node_id IS NOT NULL
-    `;
+    const referencedNodes = yield* sql<{ readonly id: string }>`${nodeReferences(threadId)}`;
     const trimmedNodeKinds: ReadonlyArray<string> = TRIMMED_NODE_KINDS;
     const liveNodeStatuses: ReadonlyArray<string> = LIVE_NODE_STATUSES;
     const removedNodes = unreferenced(
@@ -363,27 +413,75 @@ const make = Effect.gen(function* () {
           outcome = "thread-in-use";
           return [];
         }
-        const itemRows =
+        const itemIds =
           page.itemIds.length === 0
             ? []
             : yield* sql<{ readonly id: TurnItemId }>`
-                SELECT turn_item_id AS id FROM orchestration_v2_projection_turn_items
-                WHERE thread_id = ${threadId} AND turn_item_id IN ${sql.in(page.itemIds)}
-                  AND status NOT IN ${sql.in(LIVE_ITEM_STATUSES)} AND inline_work_output = 0
-              `;
-        const nodeRows =
+          SELECT turn_item_id AS id FROM orchestration_v2_projection_turn_items
+          WHERE thread_id = ${threadId} AND turn_item_id IN ${sql.in(page.itemIds)}
+            AND status NOT IN ${sql.in(LIVE_ITEM_STATUSES)} AND inline_work_output = 0
+        `;
+        const itemChildren =
+          page.itemIds.length === 0
+            ? []
+            : yield* sql<{
+                readonly id: string;
+                readonly parent: string;
+              }>`
+          SELECT turn_item_id AS id, parent_item_id AS parent
+          FROM orchestration_v2_projection_turn_items
+          WHERE thread_id = ${threadId} AND parent_item_id IN ${sql.in(page.itemIds)}
+        `;
+        const items = withoutParentsOfKept(
+          itemIds.map((row) => row.id),
+          itemChildren,
+          [],
+        );
+
+        const nodeIds =
           page.nodeIds.length === 0
             ? []
             : yield* sql<{ readonly id: NodeId }>`
-                SELECT node_id AS id FROM orchestration_v2_projection_nodes
-                WHERE thread_id = ${threadId} AND node_id IN ${sql.in(page.nodeIds)}
-                  AND status NOT IN ${sql.in(LIVE_NODE_STATUSES)}
-              `;
-        if (itemRows.length === 0 && nodeRows.length === 0) return [];
-        removed = {
-          itemIds: new Set(itemRows.map((row) => row.id)),
-          nodeIds: new Set(nodeRows.map((row) => row.id)),
-        };
+          SELECT node_id AS id FROM orchestration_v2_projection_nodes
+          WHERE thread_id = ${threadId} AND node_id IN ${sql.in(page.nodeIds)}
+            AND status NOT IN ${sql.in(LIVE_NODE_STATUSES)}
+        `;
+        const nodeChildren =
+          page.nodeIds.length === 0
+            ? []
+            : yield* sql<{
+                readonly id: string;
+                readonly parent: string;
+              }>`
+          SELECT node_id AS id, parent_node_id AS parent FROM orchestration_v2_projection_nodes
+          WHERE thread_id = ${threadId} AND parent_node_id IN ${sql.in(page.nodeIds)}
+        `;
+        const nodeHolders =
+          page.nodeIds.length === 0
+            ? []
+            : yield* sql<{
+                readonly id: string;
+                readonly node: string;
+              }>`
+          SELECT turn_item_id AS id, node_id AS node FROM orchestration_v2_projection_turn_items
+          WHERE thread_id = ${threadId} AND node_id IN ${sql.in(page.nodeIds)}
+        `;
+        const otherReferences =
+          page.nodeIds.length === 0
+            ? []
+            : yield* sql<{ readonly id: string }>`
+          SELECT id FROM (${nodeReferences(threadId)}) WHERE id IN ${sql.in(page.nodeIds)}
+        `;
+        const nodes = withoutParentsOfKept(
+          nodeIds.map((row) => row.id),
+          nodeChildren,
+          [
+            ...nodeHolders.flatMap((row) => (items.has(row.id) ? [] : [row.node])),
+            ...otherReferences.map((row) => row.id),
+          ],
+        );
+        if (items.size === 0 && nodes.size === 0) return [];
+        removed = { itemIds: items, nodeIds: nodes };
         const noticeId = ids.derive.runSignalTurnItem({
           runId: current.runId,
           signal: NOTICE_SIGNAL,
@@ -391,18 +489,31 @@ const make = Effect.gen(function* () {
         const noticed = yield* sql`
           SELECT 1 FROM orchestration_v2_projection_turn_items WHERE turn_item_id = ${noticeId}
         `;
-        const events: Array<OrchestrationV2DomainEvent> =
-          noticed.length === 0 ? [yield* noticeEvent(current, afterDays)] : [];
-        events.push({
-          id: yield* ids.allocate.event({ threadId }),
-          type: "thread.history-trimmed",
-          threadId,
-          occurredAt: DateTime.makeUnsafe(current.updatedAt),
-          payload: {
-            turnItemIds: itemRows.map((row) => row.id),
-            nodeIds: nodeRows.map((row) => row.id),
-          },
-        });
+        const events: Array<OrchestrationV2DomainEvent> = [];
+        let notice: OrchestrationV2TurnItem | undefined;
+        if (noticed.length === 0) {
+          const event = yield* noticeEvent(current, afterDays);
+          // Placed here rather than by EventSink, so forks get the position the source shows.
+          notice = yield* positions.normalize(event.payload, current.runOrdinal);
+          events.push({ ...event, payload: notice });
+        }
+        const payload = {
+          sourceThreadId: threadId,
+          turnItemIds: itemIds.flatMap((row) => (items.has(row.id) ? [row.id] : [])),
+          nodeIds: nodeIds.flatMap((row) => (nodes.has(row.id) ? [row.id] : [])),
+          ...(notice === undefined ? {} : { notice }),
+        };
+        const occurredAt = yield* DateTime.now;
+        // Each fork gets its own copy, so its revision moves with the rows it inherits.
+        for (const target of [threadId, ...(yield* readForks(threadId)).map((row) => row.id)]) {
+          events.push({
+            id: yield* ids.allocate.event({ threadId: target }),
+            type: "thread.history-trimmed",
+            threadId: target,
+            occurredAt,
+            payload,
+          });
+        }
         return events;
       }),
     );
@@ -560,4 +671,6 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(ThreadHistoryTrim, make);
+export const layer = Layer.effect(ThreadHistoryTrim, make).pipe(
+  Layer.provide(TurnItemPositionStore.layer),
+);

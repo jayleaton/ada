@@ -1584,11 +1584,12 @@ export const OrchestrationV2CheckpointRollbackRequest = Schema.Struct({
 export type OrchestrationV2CheckpointRollbackRequest =
   typeof OrchestrationV2CheckpointRollbackRequest.Type;
 
-/** Rows a history trim removed from the thread's projection. */
-const OrchestrationV2ThreadHistoryTrimmed = Schema.Struct({
+/** Rows a history trim removed from `sourceThreadId`; its forks hear it on their own streams. */
+const OrchestrationV2ThreadHistoryTrimmedFields = {
+  sourceThreadId: ThreadId,
   turnItemIds: Schema.Array(TurnItemId),
   nodeIds: Schema.Array(NodeId),
-});
+};
 
 export class OrchestrationV2CheckpointUnavailableError extends Schema.TaggedError<OrchestrationV2CheckpointUnavailableError>()(
   "OrchestrationV2CheckpointUnavailableError",
@@ -2191,7 +2192,11 @@ export const OrchestrationV2DomainEvent = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
     type: Schema.Literal("thread.history-trimmed"),
-    payload: OrchestrationV2ThreadHistoryTrimmed,
+    payload: Schema.Struct({
+      ...OrchestrationV2ThreadHistoryTrimmedFields,
+      /** The notice the source gained, for forks that show the run it is in. */
+      notice: Schema.optional(OrchestrationV2TurnItem),
+    }),
   }),
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
@@ -3144,7 +3149,10 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("thread.history-trimmed"),
-    payload: OrchestrationV2ThreadHistoryTrimmed,
+    payload: Schema.Struct({
+      ...OrchestrationV2ThreadHistoryTrimmedFields,
+      notice: Schema.optional(OrchestrationV2TurnItemJson),
+    }),
   }),
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,

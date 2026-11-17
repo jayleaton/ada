@@ -624,10 +624,43 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
       type: "thread.history-trimmed",
       threadId,
       occurredAt: now,
-      payload: { turnItemIds: [local.id, inherited.id], nodeIds: [] },
+      payload: { sourceThreadId: threadId, turnItemIds: [local.id, inherited.id], nodeIds: [] },
     } as unknown as OrchestrationV2DomainEvent);
     expect(trimmed?.turnItems).toEqual([]);
     expect(trimmed?.visibleTurnItems).toEqual([inheritedRow]);
+    // A fork hears its source's trim on its own stream and drops only the inherited rows.
+    const sourceTrimmed = applyOrchestrationV2ProjectionEvent(projection, {
+      id: "event-source-trimmed",
+      type: "thread.history-trimmed",
+      threadId,
+      occurredAt: now,
+      payload: {
+        sourceThreadId: inheritedRow.sourceThreadId,
+        turnItemIds: [inherited.id, local.id],
+        nodeIds: [],
+      },
+    } as unknown as OrchestrationV2DomainEvent);
+    expect(sourceTrimmed?.turnItems).toEqual([local]);
+    expect(sourceTrimmed?.visibleTurnItems).toEqual([{ ...localRow, position: 0 }]);
+    // The source's notice lands after the last row the fork inherits from its run.
+    const notice = commandItem("item-notice");
+    const noticed = applyOrchestrationV2ProjectionEvent(projection, {
+      id: "event-source-noticed",
+      type: "thread.history-trimmed",
+      threadId,
+      occurredAt: now,
+      payload: {
+        sourceThreadId: inheritedRow.sourceThreadId,
+        turnItemIds: [],
+        nodeIds: [],
+        notice,
+      },
+    } as unknown as OrchestrationV2DomainEvent);
+    expect(noticed?.visibleTurnItems.map((row) => [row.sourceItemId, row.position])).toEqual([
+      [inherited.id, 0],
+      [notice.id, 1],
+      [local.id, 2],
+    ]);
   });
 });
 

@@ -16,6 +16,7 @@ import {
   TurnItemId,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -64,6 +65,8 @@ type SeedOptions = {
   readonly runStatus?: OrchestrationV2Run["status"];
   readonly userMessageAt?: DateTime.Utc;
   readonly extraReasoning?: number;
+  /** A reasoning row under `command`, written after every other row. */
+  readonly commandChild?: boolean;
 };
 
 const seedThread = Effect.fn(function* (name: string, options: SeedOptions = {}) {
@@ -208,14 +211,6 @@ const seedThread = Effect.fn(function* (name: string, options: SeedOptions = {})
         attachments: [],
       }),
       item({ ...itemBase("reasoning"), type: "reasoning", text: "thinking", streaming: false }),
-      ...Array.from({ length: options.extraReasoning ?? 0 }, (_, index) =>
-        item({
-          ...itemBase(`reasoning-${index}`),
-          type: "reasoning",
-          text: "more thinking",
-          streaming: false,
-        }),
-      ),
       item({
         ...itemBase("command", commandNodeId),
         type: "command_execution",
@@ -269,6 +264,24 @@ const seedThread = Effect.fn(function* (name: string, options: SeedOptions = {})
         text: "Fixed the harness.",
         streaming: false,
       }),
+      ...Array.from({ length: options.extraReasoning ?? 0 }, (_, index) =>
+        item({
+          ...itemBase(`reasoning-${index}`),
+          type: "reasoning",
+          text: "more thinking",
+          streaming: false,
+        }),
+      ),
+      ...(options.commandChild === true
+        ? [
+            item({
+              ...itemBase("command-child", null, "command"),
+              type: "reasoning",
+              text: "why the command ran",
+              streaming: false,
+            }),
+          ]
+        : []),
     ],
   });
   return { threadId, runId };
@@ -491,31 +504,65 @@ type Hook = Effect.Effect<
   | ProjectionStore.ProjectionStoreV2
   | ServerSettings.ServerSettingsService
 >;
-const isNotice = (events: ReadonlyArray<OrchestrationV2DomainEvent>) =>
-  events.some(
-    (event) => event.type === "turn-item.updated" && event.payload.type === "system_notice",
-  );
-/** Runs `hook` at the pass's `atWrite`th write: after it chose what to remove, before removing it. */
-const duringTrim = (hook: Hook, atWrite = 1) => {
-  const hooked = Layer.effect(
-    EventSink.EventSinkV2,
-    Effect.gen(function* () {
-      const sink = yield* EventSink.EventSinkV2;
-      const context = yield* Effect.context<Effect.Services<Hook>>();
-      let writes = 0;
-      const next = Effect.suspend(() =>
-        ++writes === atWrite ? hook.pipe(Effect.provide(context), Effect.orDie) : Effect.void,
-      );
-      return EventSink.EventSinkV2.of({
-        ...sink,
-        write: (input) =>
-          sink.write(input).pipe(Effect.tap(() => (isNotice(input.events) ? next : Effect.void))),
-        writeBuilt: (build) => next.pipe(Effect.andThen(sink.writeBuilt(build))),
-      });
-    }),
-  );
-  return ThreadHistoryTrim.layer.pipe(Layer.provide(hooked), Layer.provideMerge(dependencies(30)));
-};
+class TrimHook extends Context.Service<
+  TrimHook,
+  {
+    /** Runs `hook` before the pass's `atWrite`th page: after it chose rows, before it removes them. */
+    readonly arm: (hook: Hook, atWrite?: number) => Effect.Effect<void>;
+    readonly disarm: Effect.Effect<void>;
+    readonly next: Hook;
+  }
+>()("t3/orchestration-v2/ThreadHistoryTrim.test/TrimHook") {}
+const trimHook = Layer.effect(
+  TrimHook,
+  Effect.sync(() => {
+    let armed: { readonly hook: Hook; readonly atWrite: number; writes: number } | null = null;
+    return TrimHook.of({
+      arm: (hook, atWrite = 1) =>
+        Effect.sync(() => {
+          armed = { hook, atWrite, writes: 0 };
+        }),
+      disarm: Effect.sync(() => {
+        armed = null;
+      }),
+      next: Effect.suspend(() =>
+        armed !== null && ++armed.writes === armed.atWrite ? armed.hook : Effect.void,
+      ),
+    });
+  }),
+);
+const hookedSink = Layer.effect(
+  EventSink.EventSinkV2,
+  Effect.gen(function* () {
+    const sink = yield* EventSink.EventSinkV2;
+    const hooks = yield* TrimHook;
+    const context = yield* Effect.context<Effect.Services<Hook>>();
+    return EventSink.EventSinkV2.of({
+      ...sink,
+      writeBuilt: (build) =>
+        hooks.next.pipe(
+          Effect.provide(context),
+          Effect.orDie,
+          Effect.andThen(sink.writeBuilt(build)),
+        ),
+    });
+  }),
+);
+// One migrated database for every hooked case; `isolate` clears what an earlier case left.
+const hookedFixture = Layer.mergeAll(
+  ThreadHistoryTrim.layer.pipe(Layer.provide(hookedSink)),
+  Layer.effectDiscard(createProject),
+).pipe(Layer.provideMerge(Layer.mergeAll(trimHook, dependencies(30))));
+const isolate = Effect.gen(function* () {
+  yield* TestClock.setTime(DateTime.toEpochMillis(now));
+  yield* (yield* TrimHook).disarm;
+  yield* (yield* ServerSettings.ServerSettingsService).updateSettings({
+    threadHistoryTrimAfterDays: 30,
+  });
+  yield* trim;
+});
+const arm = (hook: Hook, atWrite?: number) =>
+  Effect.flatMap(TrimHook, (hooks) => hooks.arm(hook, atWrite));
 
 const updateThread = (
   name: string,
@@ -619,86 +666,170 @@ const activities: ReadonlyArray<readonly [string, Hook]> = [
   ],
 ];
 
-it.effect.each(activities)(
-  "stops trimming a thread that is %s during the pass",
-  ([name, activity]) =>
+const ids = (projection: OrchestrationV2ThreadProjection) => ({
+  turnItems: projection.turnItems.map((item) => item.id).toSorted(),
+  nodes: projection.nodes.map((node) => node.id).toSorted(),
+  visible: projection.visibleTurnItems.map((row) => row.sourceItemId),
+});
+type Snapshot = {
+  readonly snapshotSequence: number;
+  readonly projection: OrchestrationV2ThreadProjection;
+};
+
+/** A client that read `threadId` mid-pass, left the caches warm, and then replays its stream. */
+const midPassReader = (threadId: ThreadId) => {
+  let warmed: Snapshot | undefined;
+  const read: Hook = Effect.gen(function* () {
+    const store = yield* ProjectionStore.ProjectionStoreV2;
+    warmed = yield* store.getThreadSnapshot(threadId);
+    yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 50 });
+    yield* store.searchThread({ threadId, query: "flaky" });
+  });
+  const verify = (removed: Array<string>) =>
     Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(now));
-      const { threadId } = yield* seedThread(name);
-      yield* trim;
-      assert.deepEqual(yield* itemTitles(threadId), everyItem);
-    }).pipe(Effect.provide(duringTrim(activity))),
-);
-
-it.effect("stops between pages once the thread is opened", () =>
-  Effect.gen(function* () {
-    yield* TestClock.setTime(DateTime.toEpochMillis(now));
-    const { threadId } = yield* seedThread("opened", { extraReasoning: 250 });
-    yield* trim;
-    // The first page of 200 went; the rest stays.
-    assert.lengthOf(yield* itemTitles(threadId), everyItem.length + 250 - 200 + 1);
-  }).pipe(
-    Effect.provide(duringTrim(updateThread("opened", "thread.visited", { lastVisitedAt: now }), 2)),
-  ),
-);
-
-it.effect(
-  "advances the thread's revision so reconnects, windows and search drop trimmed rows",
-  () => {
-    const name = "reconnect";
-    const threadId = ThreadId.make(`thread:trim:${name}`);
-    const removed = [`item:${name}:reasoning`, `item:${name}:command`];
-    let warmed:
-      | { readonly snapshotSequence: number; readonly projection: OrchestrationV2ThreadProjection }
-      | undefined;
-    // A client that read the thread mid-pass, and left the timeline and search caches warm.
-    const read: Hook = Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
-      warmed = yield* store.getThreadSnapshot(threadId);
-      yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 50 });
-      yield* store.searchThread({ threadId, query: "flaky" });
-    });
-    return Effect.gen(function* () {
-      yield* TestClock.setTime(DateTime.toEpochMillis(now));
-      const store = yield* ProjectionStore.ProjectionStoreV2;
-      const events = yield* EventStore.EventStoreV2;
-      yield* createProject;
-      yield* seedThread(name);
-      yield* trim;
       const before = warmed!;
-      assert.includeMembers(
-        before.projection.turnItems.map((item) => item.id),
-        removed,
-      );
+      assert.includeMembers(ids(before.projection).visible, removed);
 
       const after = yield* store.getThreadSnapshot(threadId);
       assert.isAbove(after.snapshotSequence, before.snapshotSequence);
-      const ids = (projection: OrchestrationV2ThreadProjection) => ({
-        turnItems: projection.turnItems.map((item) => item.id).toSorted(),
-        nodes: projection.nodes.map((node) => node.id).toSorted(),
-        visible: projection.visibleTurnItems.map((row) => row.sourceItemId),
-      });
+      assert.notIncludeMembers(ids(after.projection).visible, removed);
+      // The events a live subscriber hears, and a reconnect after `before` replays.
       const replay = yield* Stream.runCollect(
-        events.read({ threadId, afterSequence: before.snapshotSequence }),
+        (yield* EventStore.EventStoreV2).read({ threadId, afterSequence: before.snapshotSequence }),
       );
       const resumed = replay.reduce(
         (projection, stored) => ProjectionStore.applyToProjection(projection, stored.event),
         before.projection,
       );
       assert.deepEqual(ids(resumed), ids(after.projection));
-      assert.notIncludeMembers(ids(after.projection).turnItems, removed);
 
       const window = yield* store.getThreadSnapshotWindow(threadId, { rowLimit: 50 });
       assert.equal(window.snapshotSequence, after.snapshotSequence);
-      assert.notIncludeMembers(
-        window.projection.turnItems.map((item) => item.id),
-        removed,
-      );
+      assert.notIncludeMembers(ids(window.projection).visible, removed);
       const found = yield* store.searchThread({ threadId, query: "flaky" });
       assert.equal(found.snapshotSequence, after.snapshotSequence);
-    }).pipe(Effect.provide(duringTrim(read)));
-  },
-);
+    });
+  return { read, verify };
+};
+
+const orphanedItems = Effect.fn(function* (threadId: ThreadId) {
+  const sql = yield* SqlClient.SqlClient;
+  const rows = yield* sql<{ readonly id: string }>`
+    SELECT child.turn_item_id AS id FROM orchestration_v2_projection_turn_items AS child
+    WHERE child.thread_id = ${threadId} AND child.parent_item_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM orchestration_v2_projection_turn_items AS parent
+        WHERE parent.turn_item_id = child.parent_item_id
+      )
+  `;
+  return rows.map((row) => row.id);
+});
+
+it.layer(hookedFixture)("ThreadHistoryTrim during a pass", (it) => {
+  it.effect.each(activities)("stops trimming a thread that is %s", ([name, activity]) =>
+    Effect.gen(function* () {
+      yield* isolate;
+      const { threadId } = yield* seedThread(name);
+      yield* arm(activity);
+      yield* trim;
+      assert.deepEqual(yield* itemTitles(threadId), everyItem);
+    }),
+  );
+
+  it.effect("stops between pages without orphaning a kept row", () =>
+    Effect.gen(function* () {
+      yield* isolate;
+      const name = "opened-between-pages";
+      // `command` sorts into the first page and its child into the second, unless children go first.
+      const { threadId } = yield* seedThread(name, { extraReasoning: 250, commandChild: true });
+      yield* arm(updateThread(name, "thread.visited", { lastVisitedAt: now }), 2);
+      yield* trim;
+      assert.lengthOf(yield* itemTitles(threadId), everyItem.length + 251 - 200 + 1);
+      assert.deepEqual(yield* orphanedItems(threadId), []);
+    }),
+  );
+
+  it.effect("keeps a row that gains a child after the pass chose it", () =>
+    Effect.gen(function* () {
+      yield* isolate;
+      const name = "gains-child";
+      const { threadId, runId } = yield* seedThread(name);
+      const child: Hook = Effect.flatMap(EventSink.EventSinkV2, (sink) =>
+        sink.write({
+          events: [
+            {
+              id: EventId.make(`event:${name}:child`),
+              type: "turn-item.updated",
+              threadId,
+              runId,
+              occurredAt: old,
+              payload: {
+                id: TurnItemId.make(`item:${name}:late-edit`),
+                threadId,
+                runId,
+                nodeId: null,
+                providerThreadId: null,
+                providerTurnId: null,
+                nativeItemRef: null,
+                parentItemId: TurnItemId.make(`item:${name}:command`),
+                ordinal: 0,
+                status: "completed",
+                title: "late-edit",
+                startedAt: old,
+                completedAt: old,
+                updatedAt: old,
+                type: "file_change",
+                fileName: "late.ts",
+              },
+            },
+          ],
+        }),
+      );
+      yield* arm(child);
+      yield* trim;
+      assert.include(yield* itemTitles(threadId), "command");
+      assert.deepEqual(yield* orphanedItems(threadId), []);
+    }),
+  );
+
+  it.effect(
+    "advances the thread's revision so reconnects, windows and search drop trimmed rows",
+    () =>
+      Effect.gen(function* () {
+        yield* isolate;
+        const name = "reconnect";
+        const { threadId } = yield* seedThread(name);
+        const reader = midPassReader(threadId);
+        yield* arm(reader.read);
+        yield* trim;
+        yield* reader.verify([`item:${name}:reasoning`, `item:${name}:command`]);
+      }),
+  );
+
+  it.effect("advances an active fork's revision when the rows it inherits are trimmed", () =>
+    Effect.gen(function* () {
+      yield* isolate;
+      const source = yield* seedThread("fork-source");
+      const fork = yield* seedThread("fork", {
+        userMessageAt: recent,
+        thread: {
+          lineage: {
+            parentThreadId: source.threadId,
+            relationshipToParent: "fork",
+            rootThreadId: source.threadId,
+          },
+          forkedFrom: { type: "run", threadId: source.threadId, runId: source.runId },
+        },
+      });
+      const reader = midPassReader(fork.threadId);
+      yield* arm(reader.read);
+      yield* trim;
+      yield* reader.verify(["item:fork-source:reasoning", "item:fork-source:command"]);
+      assert.deepEqual(yield* itemTitles(fork.threadId), everyItem);
+    }),
+  );
+});
 
 it.layer(layerTest(0))("ThreadHistoryTrim turned off", (it) => {
   it.effect("removes nothing", () =>
