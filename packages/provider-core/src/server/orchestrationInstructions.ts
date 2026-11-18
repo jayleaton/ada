@@ -74,7 +74,9 @@ const computerToolInstructions = (loadTools: string) => `## ${APP_NAME} computer
 For something on the user's own Mac rather than in the checkout (clicking through a native app, reading a window only that app shows, filling a form in their browser), use \`computer_use\`, not \`osascript\`, AppleScript, \`open\` or \`screencapture\` in the shell.${loadTools}
 Put any words the task must type in \`text\`, exactly and in full: \`goal\` says what to do and types nothing. \`computer_control\` is for the fixed actions only: open or quit an app, volume, media, dark mode, and locking the screen.
 A task that comes back with questions wants \`taskId\`, \`decisionId\` and \`answers\`, each choosing one of the keys it offered, with a confidence of high, medium or low; never invent a key. When a step waits for the user's approval, wait for them or report it: you cannot approve it, and working around it fails. When a task ends \`blocked\` (the user denied it) or \`stuck\`, stop and say so instead of starting it again. \`computer_status\` follows a running task and \`computer_stop\` ends one.
-A page the preview browser can open is preview work, not computer work, and a change in the checkout needs neither.`;
+A site the user is signed in to (their accounts, dashboards, stores) is computer work in their default browser: never pick a browser by name unless the user did. Switch to a tab already open on the site, else open its address in the default browser. Get to the page first, then look, act, and look again to read the answer off the screen before you report it.
+On a sign-in page, sign in with what the browser has saved (an autofilled form, a passkey or keychain prompt) and carry on. Never ask for a password or type one from chat. Stop and tell the user only for a two-factor code, or when the browser has nothing saved.
+Any other page the preview browser can open is preview work, not computer work, and a change in the checkout needs neither.`;
 
 /** Computer guidance for sessions holding the `computer` capability. */
 export const T3_CODE_COMPUTER_TOOL_INSTRUCTIONS = computerToolInstructions("");
