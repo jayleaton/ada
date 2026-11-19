@@ -17,7 +17,7 @@ import {
   type UpdateCheckCommands,
   type UpdateCheckEnvironment,
 } from "./updateCheck.ts";
-import { createRuntimeCommand, isAtomCommandInterrupted, runAtomCommand } from "./state/runtime.ts";
+import { createRuntimeCommand, runAtomCommand } from "./state/runtime.ts";
 
 function provider(
   driver: string,
@@ -153,20 +153,17 @@ describe("checkEnvironmentUpdates", () => {
     await interrupted.promise;
   });
 
-  it("stops waiting on a refresh it joined, which the refresh's own bound interrupts", async () => {
+  it("stops waiting on a refresh it joined at its own deadline", async () => {
     using _timers = { [Symbol.dispose]: () => vi.useRealTimers() };
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const interrupted = Promise.withResolvers<void>();
     const registry = AtomRegistry.make();
     const refreshProviders = createRuntimeCommand(Atom.runtime(Layer.empty), {
       label: "refresh-providers",
       concurrency: { mode: "singleFlight", key: ({ environmentId }) => environmentId },
-      timeout: "5 seconds",
-      execute: (_: { readonly environmentId: string }) =>
-        Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => interrupted.resolve()))),
+      execute: (_: { readonly environmentId: string }) => Effect.never,
     });
     // Started elsewhere, with no deadline of its own.
-    const elsewhere = runAtomCommand(registry, refreshProviders, { environmentId: "studio" });
+    void runAtomCommand(registry, refreshProviders, { environmentId: "studio" });
     const check = checkEnvironmentUpdates([environment("studio", "0.1.10")], {
       lookupNpmRelease: async () => AsyncResult.success(null),
       refreshProviders: (target, run) => runAtomCommand(registry, refreshProviders, target, run),
@@ -178,9 +175,41 @@ describe("checkEnvironmentUpdates", () => {
       subject: "Providers on studio",
       result: { status: "error", reason: "No answer after 2 seconds." },
     });
-    await vi.advanceTimersByTimeAsync(3_000);
-    await interrupted.promise;
-    expect(isAtomCommandInterrupted(await elsewhere)).toBe(true);
+  });
+
+  it("leaves a refresh it started running for a manual refresh that joined it", async () => {
+    using _timers = { [Symbol.dispose]: () => vi.useRealTimers() };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const started = Promise.withResolvers<void>();
+    const answer = Promise.withResolvers<void>();
+    let interrupted = false;
+    const registry = AtomRegistry.make();
+    const refreshProviders = createRuntimeCommand(Atom.runtime(Layer.empty), {
+      label: "refresh-providers",
+      concurrency: { mode: "singleFlight", key: ({ environmentId }) => environmentId },
+      execute: (_: { readonly environmentId: string }) =>
+        Effect.sync(() => started.resolve()).pipe(
+          Effect.andThen(Effect.promise(() => answer.promise)),
+          Effect.as({ providers: [] }),
+          Effect.onInterrupt(() => Effect.sync(() => (interrupted = true))),
+        ),
+    });
+    const check = checkEnvironmentUpdates([environment("studio", "0.1.10")], {
+      lookupNpmRelease: async () => AsyncResult.success(null),
+      refreshProviders: (target, run) => runAtomCommand(registry, refreshProviders, target, run),
+      timeoutMs: 2_000,
+    });
+    await started.promise;
+    const manual = runAtomCommand(registry, refreshProviders, { environmentId: "studio" });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect((await check)[1]).toEqual({
+      subject: "Providers on studio",
+      result: { status: "error", reason: "No answer after 2 seconds." },
+    });
+    answer.resolve();
+    expect(await manual).toMatchObject({ _tag: "Success", value: { providers: [] } });
+    expect(interrupted).toBe(false);
   });
 });
 
