@@ -1,3 +1,81 @@
+diff --git a/out/differentialDownloader/DifferentialDownloader.js b/out/differentialDownloader/DifferentialDownloader.js
+index c6e948a79d1bb85122b21d8ddd61a5a842ca2e8d..8ccd51497b6d1ce3047afbeabac6a74cf8923f56 100644
+--- a/out/differentialDownloader/DifferentialDownloader.js
++++ b/out/differentialDownloader/DifferentialDownloader.js
+@@ -17,6 +17,20 @@ class DifferentialDownloader {
+         this.options = options;
+         this.fileMetadataBuffer = null;
+         this.logger = options.logger;
++        this.openRequests = new Set();
++    }
++    // Upstream never handed the cancellation token to range requests, so a cancelled download kept
++    // them open and kept AppUpdater's downloadPromise reserved until they ended.
++    createRequest(requestOptions, callback) {
++        const request = this.httpExecutor.createRequest(requestOptions, callback);
++        this.openRequests.add(request);
++        request.on("close", () => this.openRequests.delete(request));
++        return request;
++    }
++    abortRequests() {
++        for (const request of this.openRequests) {
++            request.abort();
++        }
+     }
+     createRequestOptions() {
+         const result = {
+@@ -98,7 +112,8 @@ class DifferentialDownloader {
+         const newFileFd = await (0, fs_extra_1.open)(this.options.newFile, "w");
+         fdList.push({ descriptor: newFileFd, path: this.options.newFile });
+         const fileOut = (0, fs_1.createWriteStream)(this.options.newFile, { fd: newFileFd });
+-        await new Promise((resolve, reject) => {
++        await this.options.cancellationToken.createPromise((resolve, reject, onCancel) => {
++            onCancel(() => this.abortRequests());
+             const streams = [];
+             // Create our download info transformer if we have one
+             let downloadInfoTransform = undefined;
+@@ -186,7 +201,7 @@ class DifferentialDownloader {
+                 if (downloadInfoTransform) {
+                     downloadInfoTransform.beginRangeDownload();
+                 }
+-                const request = this.httpExecutor.createRequest(requestOptions, response => {
++                const request = this.createRequest(requestOptions, response => {
+                     response.on("error", reject);
+                     response.on("aborted", () => {
+                         reject(new Error("response has been aborted by the server"));
+@@ -239,8 +254,9 @@ class DifferentialDownloader {
+         return buffer;
+     }
+     request(requestOptions, dataHandler) {
+-        return new Promise((resolve, reject) => {
+-            const request = this.httpExecutor.createRequest(requestOptions, response => {
++        return this.options.cancellationToken.createPromise((resolve, reject, onCancel) => {
++            onCancel(() => this.abortRequests());
++            const request = this.createRequest(requestOptions, response => {
+                 if (!(0, multipleRangeDownloader_1.checkIsRangesSupported)(response, reject)) {
+                     return;
+                 }
+diff --git a/out/differentialDownloader/multipleRangeDownloader.js b/out/differentialDownloader/multipleRangeDownloader.js
+index 56adc38fe831b39d8430ad8aabe8fd7a35c36b9f..4ec2494a8c64973d3cc498b124817596ace5d690 100644
+--- a/out/differentialDownloader/multipleRangeDownloader.js
++++ b/out/differentialDownloader/multipleRangeDownloader.js
+@@ -54,7 +54,7 @@ function doExecuteTasks(differentialDownloader, options, out, resolve, reject) {
+             else {
+                 const requestOptions = differentialDownloader.createRequestOptions();
+                 requestOptions.headers.Range = `bytes=${task.start}-${task.end - 1}`;
+-                const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
++                const request = differentialDownloader.createRequest(requestOptions, response => {
+                     response.on("error", reject);
+                     if (!checkIsRangesSupported(response, reject)) {
+                         return;
+@@ -73,7 +73,7 @@ function doExecuteTasks(differentialDownloader, options, out, resolve, reject) {
+     }
+     const requestOptions = differentialDownloader.createRequestOptions();
+     requestOptions.headers.Range = ranges.substring(0, ranges.length - 2);
+-    const request = differentialDownloader.httpExecutor.createRequest(requestOptions, response => {
++    const request = differentialDownloader.createRequest(requestOptions, response => {
+         if (!checkIsRangesSupported(response, reject)) {
+             return;
+         }
 diff --git a/out/electronHttpExecutor.js b/out/electronHttpExecutor.js
 index 0ae9e1126e1dc136977914ef1bfd46709fc9db1b..c298ffe7808c421c29e16f1e2ba8510f0cd31142 100644
 --- a/out/electronHttpExecutor.js
