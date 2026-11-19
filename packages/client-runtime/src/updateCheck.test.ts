@@ -17,7 +17,7 @@ import {
   type UpdateCheckCommands,
   type UpdateCheckEnvironment,
 } from "./updateCheck.ts";
-import { createRuntimeCommand, runAtomCommand } from "./state/runtime.ts";
+import { createRuntimeCommand, isAtomCommandInterrupted, runAtomCommand } from "./state/runtime.ts";
 
 function provider(
   driver: string,
@@ -151,6 +151,36 @@ describe("checkEnvironmentUpdates", () => {
     ]);
     // Only resolves once the deadline interrupts the request's effect.
     await interrupted.promise;
+  });
+
+  it("stops waiting on a refresh it joined, which the refresh's own bound interrupts", async () => {
+    using _timers = { [Symbol.dispose]: () => vi.useRealTimers() };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const interrupted = Promise.withResolvers<void>();
+    const registry = AtomRegistry.make();
+    const refreshProviders = createRuntimeCommand(Atom.runtime(Layer.empty), {
+      label: "refresh-providers",
+      concurrency: { mode: "singleFlight", key: ({ environmentId }) => environmentId },
+      timeout: "5 seconds",
+      execute: (_: { readonly environmentId: string }) =>
+        Effect.never.pipe(Effect.onInterrupt(() => Effect.sync(() => interrupted.resolve()))),
+    });
+    // Started elsewhere, with no deadline of its own.
+    const elsewhere = runAtomCommand(registry, refreshProviders, { environmentId: "studio" });
+    const check = checkEnvironmentUpdates([environment("studio", "0.1.10")], {
+      lookupNpmRelease: async () => AsyncResult.success(null),
+      refreshProviders: (target, run) => runAtomCommand(registry, refreshProviders, target, run),
+      timeoutMs: 2_000,
+    });
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect((await check)[1]).toEqual({
+      subject: "Providers on studio",
+      result: { status: "error", reason: "No answer after 2 seconds." },
+    });
+    await vi.advanceTimersByTimeAsync(3_000);
+    await interrupted.promise;
+    expect(isAtomCommandInterrupted(await elsewhere)).toBe(true);
   });
 });
 

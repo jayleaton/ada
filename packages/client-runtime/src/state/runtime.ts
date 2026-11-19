@@ -9,6 +9,7 @@ import {
   type EnvironmentId as EnvironmentIdType,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import type * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
@@ -78,6 +79,7 @@ interface EnvironmentCommandAtomOptions<Input, A, E, R> extends Omit<
     registry: AtomRegistry.AtomRegistry,
     environmentId: EnvironmentIdType,
   ) => Effect.Effect<A, E, R>;
+  readonly timeout?: Duration.Input;
 }
 
 interface EnvironmentQueryAtomOptions<Input, A, E, R> extends Omit<
@@ -199,6 +201,20 @@ async function settleAtomCommandResult<A, E>(
   } catch (defect) {
     return AsyncResult.failure(Cause.die(defect));
   }
+}
+
+// A caller may have joined a run another caller started, so its own signal only ends its wait.
+function abandonOnAbort<A, E>(
+  result: Promise<AtomCommandResult<A, E>>,
+  signal: AbortSignal | undefined,
+): Promise<AtomCommandResult<A, E>> {
+  if (signal === undefined) return result;
+  if (signal.aborted) return Promise.resolve(AsyncResult.failure(Cause.interrupt()));
+  return new Promise((resolve) => {
+    const abandon = () => resolve(AsyncResult.failure(Cause.interrupt()));
+    signal.addEventListener("abort", abandon, { once: true });
+    void result.then(resolve).finally(() => signal.removeEventListener("abort", abandon));
+  });
 }
 
 export function createAtomCommandScheduler(): AtomCommandScheduler {
@@ -444,6 +460,8 @@ export function createRuntimeCommand<R, ER, W, A, E>(
     readonly execute: (input: W, registry: AtomRegistry.AtomRegistry) => Effect.Effect<A, E, R>;
     readonly scheduler?: AtomCommandScheduler;
     readonly concurrency?: AtomCommandConcurrency<W>;
+    /** Interrupts a run that lasts longer, ending its request for every caller waiting on it. */
+    readonly timeout?: Duration.Input;
   },
 ): AtomCommand<W, A, E | ER> {
   const scheduler = options.scheduler ?? createAtomCommandScheduler();
@@ -451,17 +469,29 @@ export function createRuntimeCommand<R, ER, W, A, E>(
   return {
     label: options.label,
     run: (registry, input, run) =>
-      settleAtomCommandResult(() =>
-        scheduler.schedule(registry, concurrency, input, () => {
-          const atom = runtime
-            .atom(options.execute(input, registry))
-            .pipe(Atom.withLabel(options.label));
-          return executeAtomQuery(registry, atom, {
-            reportDefect: false,
-            reportFailure: false,
-            ...(run?.signal === undefined ? {} : { signal: run.signal }),
-          });
-        }),
+      abandonOnAbort(
+        settleAtomCommandResult(() =>
+          scheduler.schedule(registry, concurrency, input, () => {
+            const execute = options.execute(input, registry);
+            const { timeout } = options;
+            const atom = runtime
+              .atom(
+                timeout === undefined
+                  ? execute
+                  : Effect.timeoutOrElse(execute, {
+                      duration: timeout,
+                      orElse: () => Effect.interrupt,
+                    }),
+              )
+              .pipe(Atom.withLabel(options.label));
+            return executeAtomQuery(registry, atom, {
+              reportDefect: false,
+              reportFailure: false,
+              ...(run?.signal === undefined ? {} : { signal: run.signal }),
+            });
+          }),
+        ),
+        run?.signal,
       ),
   };
 }
@@ -948,6 +978,7 @@ export function createEnvironmentCommand<R, ER, Input, A, E>(
     label: options.label,
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
+    ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
     execute: (target, registry) =>
       runInEnvironment(
         target.environmentId,
@@ -1082,6 +1113,7 @@ export function createEnvironmentRpcCommand<
       readonly environmentId: EnvironmentIdType;
       readonly input: NoInfer<Input>;
     }>;
+    readonly timeout?: Duration.Input;
     readonly onSuccess?: (
       target: {
         readonly environmentId: EnvironmentIdType;
@@ -1105,6 +1137,7 @@ export function createEnvironmentRpcCommand<
     label: options.label,
     ...(options.scheduler === undefined ? {} : { scheduler: options.scheduler }),
     ...(options.concurrency === undefined ? {} : { concurrency: options.concurrency }),
+    ...(options.timeout === undefined ? {} : { timeout: options.timeout }),
     execute: (input: Input, registry, environmentId) => {
       const target = {
         environmentId,

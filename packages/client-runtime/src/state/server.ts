@@ -1714,6 +1714,8 @@ export function createServerEnvironmentAtoms<R, E>(
             input.modelCatalogOnly ?? false,
           ]),
       },
+      // Callers that join a running refresh cannot cancel it, so a stalled one must still end.
+      timeout: "60 seconds",
     }),
     updateProvider: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:update-provider",
