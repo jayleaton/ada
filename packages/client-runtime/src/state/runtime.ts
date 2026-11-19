@@ -145,9 +145,18 @@ export interface AtomCommandReporter {
   readonly error: (message: string, cause: Cause.Cause<unknown>) => void;
 }
 
+export interface AtomCommandRunOptions {
+  /** Aborting interrupts the command's effect, and with it any request the command is waiting on. */
+  readonly signal?: AbortSignal;
+}
+
 export interface AtomCommand<W, A, E> {
   readonly label: string;
-  readonly run: (registry: AtomRegistry.AtomRegistry, input: W) => Promise<AtomCommandResult<A, E>>;
+  readonly run: (
+    registry: AtomRegistry.AtomRegistry,
+    input: W,
+    options?: AtomCommandRunOptions,
+  ) => Promise<AtomCommandResult<A, E>>;
 }
 
 export type AtomCommandConcurrency<W> =
@@ -339,10 +348,13 @@ export async function runAtomCommand<W, A, E>(
   registry: AtomRegistry.AtomRegistry,
   command: AtomCommand<W, A, E>,
   input: W,
-  options: AtomCommandOptions = {},
+  options: AtomCommandOptions & AtomCommandRunOptions = {},
   reporter: AtomCommandReporter = console,
 ): Promise<AtomCommandResult<A, E>> {
-  const result = await settleAtomCommandResult(() => command.run(registry, input));
+  const { signal } = options;
+  const result = await settleAtomCommandResult(() =>
+    command.run(registry, input, signal === undefined ? {} : { signal }),
+  );
   reportAtomCommandResult(result, { ...options, label: options.label ?? command.label }, reporter);
   return result;
 }
@@ -438,13 +450,17 @@ export function createRuntimeCommand<R, ER, W, A, E>(
   const concurrency = options.concurrency ?? { mode: "parallel" as const };
   return {
     label: options.label,
-    run: (registry, input) =>
+    run: (registry, input, run) =>
       settleAtomCommandResult(() =>
         scheduler.schedule(registry, concurrency, input, () => {
           const atom = runtime
             .atom(options.execute(input, registry))
             .pipe(Atom.withLabel(options.label));
-          return executeAtomQuery(registry, atom, { reportDefect: false, reportFailure: false });
+          return executeAtomQuery(registry, atom, {
+            reportDefect: false,
+            reportFailure: false,
+            ...(run?.signal === undefined ? {} : { signal: run.signal }),
+          });
         }),
       ),
   };
