@@ -1982,3 +1982,41 @@ it.effect(
       ),
     ),
 );
+
+it.effect("a late first delivery of an old un-settle leaves what a newer settlement settled", () =>
+  Effect.gen(function* () {
+    const projections = yield* ProjectionStoreV2;
+    const settlements = yield* ParentSettlementFollow.ParentSettlementFollow;
+    const devBox = EnvironmentId.make("environment-dev-box");
+    const generationA = DateTime.makeUnsafe("2026-10-22T10:00:00.000Z");
+    const generationB = DateTime.add(generationA, { hours: 1 });
+    const follow = (action: "settle" | "unsettle", at: DateTime.Utc) =>
+      settlements
+        .follow({
+          parentEnvironmentId: devBox,
+          parentThreadIds: [ThreadId.make("card")],
+          action,
+          settledBy: ThreadId.make("card"),
+          settledAt: DateTime.formatIso(at),
+        })
+        .pipe(Effect.tap(() => drainEffects));
+
+    yield* createUnder("child", { threadId: "card", environmentId: devBox });
+    yield* createUnder("grandchild", { threadId: "child" });
+    // The card was settled at A, un-settled, and settled again at B; only B reached here so far.
+    yield* follow("settle", generationB);
+    yield* follow("unsettle", generationA);
+    for (const id of ["child", "grandchild"]) {
+      const thread = yield* projections.getThread(ThreadId.make(id));
+      assert.equal(thread.settledOverride, "settled");
+      assert.deepEqual(thread.settledAt, generationB);
+    }
+  }).pipe(
+    Effect.provide(
+      ParentSettlementFollow.layer.pipe(
+        Layer.provide(NodeCrypto.layer),
+        Layer.provideMerge(testLayer),
+      ),
+    ),
+  ),
+);
