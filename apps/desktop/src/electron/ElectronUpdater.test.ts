@@ -126,15 +126,22 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
 );
 
 // Electron's net module only exists in Electron; node:http stands in under the real download code.
+// `onRead` sees each response after electron-updater has handled its end.
 class NodeHttpExecutor extends ElectronHttpExecutor {
+  readonly onRead: (response: NodeHttp.IncomingMessage) => void;
+  constructor(onRead: (response: NodeHttp.IncomingMessage) => void) {
+    super();
+    this.onRead = onRead;
+  }
   override createRequest(options: NodeHttp.RequestOptions, callback: (response: unknown) => void) {
-    return NodeHttp.request(options, callback) as unknown as ReturnType<
-      ElectronHttpExecutor["createRequest"]
-    >;
+    return NodeHttp.request(options, (response) => {
+      callback(response);
+      response.once("end", () => this.onRead(response));
+    }) as unknown as ReturnType<ElectronHttpExecutor["createRequest"]>;
   }
 }
 
-// An AppImage: two 16-byte blocks, then its deflated block map and the map's length.
+// An AppImage: 16-byte blocks, then its deflated block map and the map's length.
 const appImage = (blocks: ReadonlyArray<string>) => {
   const blockMap = NodeZlib.deflateRawSync(
     JSON.stringify({
@@ -144,24 +151,37 @@ const appImage = (blocks: ReadonlyArray<string>) => {
   );
   const blockMapSize = Buffer.alloc(4);
   blockMapSize.writeUInt32BE(blockMap.length);
-  const content = Buffer.from(blocks.map((block) => block.repeat(16)).join(""));
+  const content = Buffer.from(blocks.map((block) => block.repeat(16).slice(0, 16)).join(""));
   return { file: Buffer.concat([content, blockMap, blockMapSize]), blockMapSize: blockMap.length };
 };
 
-// Serves the new AppImage's block map, but stalls the update's own bytes after a few of them.
-const stallingUpdateServer = Effect.fn(function* (file: Buffer) {
+type AppImage = ReturnType<typeof appImage>;
+
+// Serves the update, reports where each request into its blocks starts, and stalls the requests
+// `stall` picks after a few bytes.
+const stallingUpdateServer = Effect.fn(function* (
+  update: AppImage,
+  stall: (start: number, seen: number) => boolean,
+) {
+  const { file } = update;
+  const blocksEnd = file.length - update.blockMapSize - 4;
   const stalls = yield* Queue.unbounded<Deferred.Deferred<void>>();
+  const requests = yield* Queue.unbounded<number>();
+  const seen = new Map<number, number>();
   const server = yield* Effect.acquireRelease(
     Effect.callback<NodeHttp.Server>((resume) => {
       const server = NodeHttp.createServer((request, response) => {
         const range = /bytes=(\d+)-(\d+)/.exec(request.headers.range ?? "");
         const [start, end] = range ? [Number(range[1]), Number(range[2])] : [0, file.length - 1];
         const body = file.subarray(start, end + 1);
+        const count = (seen.get(start) ?? 0) + 1;
+        seen.set(start, count);
+        if (start < blocksEnd) Queue.offerUnsafe(requests, start);
         response.writeHead(range ? 206 : 200, {
           "content-length": body.length,
           ...(range ? { "content-range": `bytes ${start}-${end}/${file.length}` } : {}),
         });
-        if (start >= 32) {
+        if (!stall(start, count)) {
           response.end(body);
           return;
         }
@@ -180,7 +200,55 @@ const stallingUpdateServer = Effect.fn(function* (file: Buffer) {
   );
   const address = server.address();
   const port = typeof address === "object" && address !== null ? address.port : 0;
-  return { url: new URL(`http://127.0.0.1:${port}/T3-Code-1.0.1.AppImage`), stalls };
+  return { url: new URL(`http://127.0.0.1:${port}/T3-Code-1.0.1.AppImage`), stalls, requests };
+});
+
+// Points the real autoUpdater at an installed ["A", "B"] AppImage and a local server for `update`.
+// `read` gets the start of each range of blocks electron-updater has finished reading.
+const serveUpdate = Effect.fn(function* (
+  update: AppImage,
+  options: {
+    readonly differential: boolean;
+    readonly stall: (start: number, seen: number) => boolean;
+  },
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const dir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-update-stall-" });
+  const installedPath = path.join(dir, "T3-Code.AppImage");
+  yield* fileSystem.writeFile(installedPath, appImage(["A", "B"]).file);
+  yield* Effect.acquireRelease(
+    Effect.sync(() => vi.stubEnv("APPIMAGE", installedPath)),
+    () => Effect.sync(() => vi.unstubAllEnvs()),
+  );
+  const server = yield* stallingUpdateServer(update, options.stall);
+  const { url } = server;
+  const blocksEnd = update.file.length - update.blockMapSize - 4;
+  const read = yield* Queue.unbounded<number>();
+  const fileInfo = {
+    url: url.pathname.slice(1),
+    size: update.file.length,
+    blockMapSize: update.blockMapSize,
+    sha512: NodeCrypto.createHash("sha512").update(update.file).digest("base64"),
+  };
+  autoUpdater.logger = null;
+  autoUpdater.disableDifferentialDownload = !options.differential;
+  Object.assign(autoUpdater, {
+    httpExecutor: new NodeHttpExecutor((response) => {
+      const start = Number(/bytes (\d+)-/.exec(response.headers["content-range"] ?? "")?.[1]);
+      if (start < blocksEnd) Queue.offerUnsafe(read, start);
+    }),
+    downloadedUpdateHelper: new DownloadedUpdateHelper(path.join(dir, "cache")),
+    updateInfoAndProvider: {
+      info: { version: "1.0.1", files: [fileInfo], path: fileInfo.url, ...fileInfo },
+      provider: {
+        resolveFiles: () => [{ url, info: fileInfo }],
+        fileExtraDownloadHeaders: null,
+        isUseMultipleRangeRequest: false,
+      },
+    },
+  });
+  return { ...server, read };
 });
 
 describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
@@ -188,39 +256,10 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
   () => {
     const cancelAndRetry = (differential: boolean) =>
       Effect.gen(function* () {
-        const fileSystem = yield* FileSystem.FileSystem;
-        const path = yield* Path.Path;
-        const dir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-update-stall-" });
-        const installed = appImage(["A", "B"]);
-        const update = appImage(["A", "C"]);
-        const installedPath = path.join(dir, "T3-Code.AppImage");
-        yield* fileSystem.writeFile(installedPath, installed.file);
-        yield* Effect.acquireRelease(
-          Effect.sync(() => vi.stubEnv("APPIMAGE", installedPath)),
-          () => Effect.sync(() => vi.unstubAllEnvs()),
-        );
-        const { url, stalls } = yield* stallingUpdateServer(update.file);
-        const fileInfo = {
-          url: url.pathname.slice(1),
-          size: update.file.length,
-          blockMapSize: update.blockMapSize,
-          sha512: NodeCrypto.createHash("sha512").update(update.file).digest("base64"),
-        };
-        autoUpdater.logger = null;
-        autoUpdater.disableDifferentialDownload = !differential;
-        Object.assign(autoUpdater, {
-          httpExecutor: new NodeHttpExecutor(),
-          downloadedUpdateHelper: new DownloadedUpdateHelper(path.join(dir, "cache")),
-          updateInfoAndProvider: {
-            info: { version: "1.0.1", files: [fileInfo], path: fileInfo.url, ...fileInfo },
-            provider: {
-              resolveFiles: () => [{ url, info: fileInfo }],
-              fileExtraDownloadHeaders: null,
-              isUseMultipleRangeRequest: false,
-            },
-          },
+        const { stalls } = yield* serveUpdate(appImage(["A", "C"]), {
+          differential,
+          stall: (start) => start < 32,
         });
-
         const electronUpdater = yield* ElectronUpdater.ElectronUpdater;
         yield* electronUpdater.on("error", () => undefined);
         const download = yield* Effect.forkChild(electronUpdater.downloadUpdate);
@@ -243,6 +282,37 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
     it.live(
       "a cancelled differential download closes its request and a retry downloads again",
       () => cancelAndRetry(true),
+    );
+
+    it.live("a differential download cancelled between ranges opens no further range", () =>
+      Effect.gen(function* () {
+        // 101 changed blocks between copies of "A": electron-updater pauses for a second after
+        // the 100th range before it copies "A" and opens the last one.
+        const update = appImage(
+          Array.from({ length: 101 }, (_, index) => ["A", `n${index}`]).flat(),
+        );
+        const firstRange = 16;
+        const { stalls, requests, read } = yield* serveUpdate(update, {
+          differential: true,
+          // The retry stalls on its first range, so any later range is the cancelled download's.
+          stall: (start, seen) => start === firstRange && seen > 1,
+        });
+        const electronUpdater = yield* ElectronUpdater.ElectronUpdater;
+        yield* electronUpdater.on("error", () => undefined);
+        const download = yield* Effect.forkChild(electronUpdater.downloadUpdate);
+        // Reading the 100th range starts the pause.
+        yield* Queue.takeN(read, 100);
+        yield* Fiber.interrupt(download);
+        yield* Queue.clear(requests);
+
+        const retry = yield* Effect.forkChild(electronUpdater.downloadUpdate);
+        yield* Queue.take(stalls);
+        assert.strictEqual(yield* Queue.take(requests), firstRange, "the retry did not start over");
+        // The cancelled download's pause ends a second after it began.
+        const late = yield* Queue.take(requests).pipe(Effect.timeoutOption("2 seconds"));
+        assert.deepStrictEqual(late, Option.none(), "the cancelled download opened another range");
+        yield* Fiber.interrupt(retry);
+      }).pipe(Effect.scoped, Effect.provide([ElectronUpdater.layer, NodeServices.layer])),
     );
   },
 );

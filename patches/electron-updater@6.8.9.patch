@@ -1,5 +1,5 @@
 diff --git a/out/differentialDownloader/DifferentialDownloader.js b/out/differentialDownloader/DifferentialDownloader.js
-index c6e948a79d1bb85122b21d8ddd61a5a842ca2e8d..8ccd51497b6d1ce3047afbeabac6a74cf8923f56 100644
+index c6e948a79d1bb85122b21d8ddd61a5a842ca2e8d..df016d23efad23dc21212912a70ae8066cf8d974 100644
 --- a/out/differentialDownloader/DifferentialDownloader.js
 +++ b/out/differentialDownloader/DifferentialDownloader.js
 @@ -17,6 +17,20 @@ class DifferentialDownloader {
@@ -23,17 +23,31 @@ index c6e948a79d1bb85122b21d8ddd61a5a842ca2e8d..8ccd51497b6d1ce3047afbeabac6a74c
      }
      createRequestOptions() {
          const result = {
-@@ -98,7 +112,8 @@ class DifferentialDownloader {
+@@ -98,7 +112,12 @@ class DifferentialDownloader {
          const newFileFd = await (0, fs_extra_1.open)(this.options.newFile, "w");
          fdList.push({ descriptor: newFileFd, path: this.options.newFile });
          const fileOut = (0, fs_1.createWriteStream)(this.options.newFile, { fd: newFileFd });
 -        await new Promise((resolve, reject) => {
 +        await this.options.cancellationToken.createPromise((resolve, reject, onCancel) => {
-+            onCancel(() => this.abortRequests());
++            let pause = null;
++            onCancel(() => {
++                clearTimeout(pause);
++                this.abortRequests();
++            });
              const streams = [];
              // Create our download info transformer if we have one
              let downloadInfoTransform = undefined;
-@@ -186,7 +201,7 @@ class DifferentialDownloader {
+@@ -163,6 +182,9 @@ class DifferentialDownloader {
+             requestOptions.redirect = "manual";
+             w = (index) => {
+                 var _a, _b;
++                if (this.options.cancellationToken.cancelled) {
++                    return;
++                }
+                 if (index >= tasks.length) {
+                     if (this.fileMetadataBuffer != null) {
+                         firstStream.write(this.fileMetadataBuffer);
+@@ -186,7 +208,7 @@ class DifferentialDownloader {
                  if (downloadInfoTransform) {
                      downloadInfoTransform.beginRangeDownload();
                  }
@@ -42,7 +56,16 @@ index c6e948a79d1bb85122b21d8ddd61a5a842ca2e8d..8ccd51497b6d1ce3047afbeabac6a74c
                      response.on("error", reject);
                      response.on("aborted", () => {
                          reject(new Error("response has been aborted by the server"));
-@@ -239,8 +254,9 @@ class DifferentialDownloader {
+@@ -205,7 +227,7 @@ class DifferentialDownloader {
+                         }
+                         if (++downloadOperationCount === 100) {
+                             downloadOperationCount = 0;
+-                            setTimeout(() => w(index), 1000);
++                            pause = setTimeout(() => w(index), 1000);
+                         }
+                         else {
+                             w(index);
+@@ -239,8 +261,9 @@ class DifferentialDownloader {
          return buffer;
      }
      request(requestOptions, dataHandler) {
@@ -55,10 +78,30 @@ index c6e948a79d1bb85122b21d8ddd61a5a842ca2e8d..8ccd51497b6d1ce3047afbeabac6a74c
                      return;
                  }
 diff --git a/out/differentialDownloader/multipleRangeDownloader.js b/out/differentialDownloader/multipleRangeDownloader.js
-index 56adc38fe831b39d8430ad8aabe8fd7a35c36b9f..4ec2494a8c64973d3cc498b124817596ace5d690 100644
+index 56adc38fe831b39d8430ad8aabe8fd7a35c36b9f..436086963c64fbe8bd5126685375dc54e669faf9 100644
 --- a/out/differentialDownloader/multipleRangeDownloader.js
 +++ b/out/differentialDownloader/multipleRangeDownloader.js
-@@ -54,7 +54,7 @@ function doExecuteTasks(differentialDownloader, options, out, resolve, reject) {
+@@ -7,6 +7,9 @@ const DataSplitter_1 = require("./DataSplitter");
+ const downloadPlanBuilder_1 = require("./downloadPlanBuilder");
+ function executeTasksUsingMultipleRangeRequests(differentialDownloader, tasks, out, oldFileFd, reject) {
+     const w = (taskOffset) => {
++        if (differentialDownloader.options.cancellationToken.cancelled) {
++            return;
++        }
+         if (taskOffset >= tasks.length) {
+             if (differentialDownloader.fileMetadataBuffer != null) {
+                 out.write(differentialDownloader.fileMetadataBuffer);
+@@ -43,6 +46,9 @@ function doExecuteTasks(differentialDownloader, options, out, resolve, reject) {
+     if (partCount <= 1) {
+         // the only remote range - copy
+         const w = (index) => {
++            if (differentialDownloader.options.cancellationToken.cancelled) {
++                return;
++            }
+             if (index >= options.end) {
+                 resolve();
+                 return;
+@@ -54,7 +60,7 @@ function doExecuteTasks(differentialDownloader, options, out, resolve, reject) {
              else {
                  const requestOptions = differentialDownloader.createRequestOptions();
                  requestOptions.headers.Range = `bytes=${task.start}-${task.end - 1}`;
@@ -67,7 +110,7 @@ index 56adc38fe831b39d8430ad8aabe8fd7a35c36b9f..4ec2494a8c64973d3cc498b124817596
                      response.on("error", reject);
                      if (!checkIsRangesSupported(response, reject)) {
                          return;
-@@ -73,7 +73,7 @@ function doExecuteTasks(differentialDownloader, options, out, resolve, reject) {
+@@ -73,7 +79,7 @@ function doExecuteTasks(differentialDownloader, options, out, resolve, reject) {
      }
      const requestOptions = differentialDownloader.createRequestOptions();
      requestOptions.headers.Range = ranges.substring(0, ranges.length - 2);
