@@ -192,6 +192,7 @@ import * as PushNotifier from "./push/PushNotifier.ts";
 import * as PushRegistrations from "./push/PushRegistrations.ts";
 import * as ThreadTaskService from "./threadTask/ThreadTaskService.ts";
 import * as ThreadTaskTransport from "./threadTask/ThreadTaskTransport.ts";
+import * as ParentSettlementFollow from "./orchestration-v2/ParentSettlementFollow.ts";
 import * as IdleCompactionService from "./orchestration-v2/IdleCompactionService.ts";
 import * as ThreadPullRequestService from "./orchestration-v2/ThreadPullRequestService.ts";
 import * as RunFinalizationService from "./orchestration-v2/RunFinalizationService.ts";
@@ -559,9 +560,10 @@ const layerOrchestrationV2Runtime = RuntimeLayer.layerProduction.pipe(
   ),
 );
 
-const layerOrchestrationApplication = Layer.merge(
+const layerOrchestrationApplication = Layer.mergeAll(
   CheckpointDiffQuery.layer,
   NativeChildWorkQuery.layer,
+  ParentSettlementFollow.layer.pipe(Layer.provide(ProjectionStoreV2.layer)),
 ).pipe(Layer.provideMerge(layerCheckpointStore), Layer.provideMerge(layerOrchestrationV2Runtime));
 
 const layerThreadSettlementWorker = Layer.effectDiscard(

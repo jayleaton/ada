@@ -47,6 +47,8 @@ import { EnvironmentToolkit } from "./toolkits/environment/tools.ts";
 import * as EnvironmentHandlers from "./toolkits/environment/handlers.ts";
 import { ThemeToolkit } from "./toolkits/theme/tools.ts";
 import * as ThemeHandlers from "./toolkits/theme/handlers.ts";
+import { PeerToolkit } from "./toolkits/peer/tools.ts";
+import * as PeerHandlers from "./toolkits/peer/handlers.ts";
 import { ProjectToolkit } from "./toolkits/project/tools.ts";
 import * as ProjectHandlers from "./toolkits/project/handlers.ts";
 import { AttachmentToolkit } from "./toolkits/attachment/tools.ts";
@@ -1355,7 +1357,9 @@ const layerToolExposure = Layer.effect(
     const server = yield* McpServer.McpServer;
     return McpToolExposure.make(
       () =>
-        server.tools.map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
+        server.tools
+          .filter(({ tool }) => !PeerToolkit.tools[tool.name as keyof typeof PeerToolkit.tools])
+          .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
       () => server.notifications["notifications/tools/list_changed"]({}),
     );
   }),
@@ -1389,4 +1393,18 @@ export const layerToolSearch = Layer.mergeAll(
   layerDeferredListing,
 ).pipe(Layer.provide(layerToolExposure));
 
-export const layer = layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch));
+/**
+ * Server-to-server calls over a peer link. Outside layerTools and never listed, so no agent's
+ * tool list or context grows with them; a linked server calls them by name.
+ */
+export const layerPeerToolkit = toolkitRegistration(PeerToolkit, PeerHandlers.layer).pipe(
+  Layer.provide(
+    McpServer.visibility(({ method }: McpServer.MiddlewareOptions) =>
+      Effect.succeed(method !== "tools/list"),
+    ).layer,
+  ),
+);
+
+export const layer = layerMcpTransport(
+  Layer.mergeAll(layerTools, layerToolSearch, layerPeerToolkit),
+);
