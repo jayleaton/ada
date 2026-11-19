@@ -25,6 +25,22 @@ import {
   McpGatewayUnavailableError,
 } from "./mcpGateway.ts";
 import {
+  ComputerAnswers,
+  ComputerAuditTailInput,
+  ComputerError,
+  ComputerHostAuthorizeInput,
+  ComputerHostConnectInput,
+  ComputerHostDecideInput,
+  ComputerHostAccessInput,
+  ComputerHostEventInput,
+  ComputerHostFrame,
+  ComputerHostRespondInput,
+  ComputerGrant,
+  ComputerRespondToApprovalInput,
+  ComputerSnapshot,
+  ComputerStopInput,
+} from "./computer.ts";
+import {
   McpAppCallToolInput,
   McpAppCallToolResult,
   McpAppReadResourceInput,
@@ -70,7 +86,7 @@ import * as Rpc from "effect/rpc/Rpc";
 import * as RpcGroup from "effect/rpc/RpcGroup";
 import * as RpcMiddleware from "effect/rpc/RpcMiddleware";
 import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
-import { SecretSourceCheckResult } from "./settingsSecretValue.ts";
+import { SecretSourceCheckResult, SettingsSecretValue } from "./settingsSecretValue.ts";
 import { SecretReference } from "./secretReference.ts";
 import {
   ProviderAuthCancelInput,
@@ -221,6 +237,32 @@ import {
   ProviderUploadFeedbackResult,
 } from "./provider.ts";
 import { ProviderInstanceId, ProviderInstanceMutation } from "./providerInstance.ts";
+import {
+  IssueCandidates,
+  IssueCommentInput,
+  IssueCommentsPage,
+  IssueCommentsPageInput,
+  IssueCreateInput,
+  IssueCreateResult,
+  IssueDetail,
+  IssueLinkedThreadsResult,
+  IssueListInput,
+  IssueListResult,
+  IssueOperationError,
+  IssueReactionInput,
+  IssueRef,
+  IssueScopeRef,
+  IssueSetStateInput,
+  IssueTemplateList,
+  IssueTrackerBindProjectInput,
+  IssueTrackerConnectInput,
+  IssueTrackerConnection,
+  IssueTrackerConnectionError,
+  IssueTrackerConnectionList,
+  IssueUnavailableError,
+  IssueUpdateInput,
+  ThreadIssueKey,
+} from "./issue.ts";
 import { PullRequestReviewGuideResult } from "./pullRequestReviewGuide.ts";
 import {
   PullRequestActionInput,
@@ -589,6 +631,17 @@ export const WS_METHODS = {
   deviceDetail: "device.detail",
   deviceAction: "device.action",
 
+  computerSubscribe: "computer.subscribe",
+  computerStop: "computer.stop",
+  computerRespondToApproval: "computer.respondToApproval",
+  computerAuditTail: "computer.auditTail",
+  computerHostConnect: "computer.hostConnect",
+  computerHostRespond: "computer.hostRespond",
+  computerHostDecide: "computer.hostDecide",
+  computerHostAuthorize: "computer.hostAuthorize",
+  computerHostEvent: "computer.hostEvent",
+  computerHostAccess: "computer.hostAccess",
+
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
   serverGetNpmRelease: "server.getNpmRelease",
@@ -630,6 +683,7 @@ export const WS_METHODS = {
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
   serverGetAgentSkills: "server.getAgentSkills",
+  serverRevealComputerGrounderKey: "server.revealComputerGrounderKey",
   serverMutateAgentLibrary: "server.mutateAgentLibrary",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverCheckSecretSource: "server.checkSecretSource",
@@ -728,6 +782,22 @@ export const WS_METHODS = {
   pullRequestsRequestReviewers: "pullRequests.requestReviewers",
   pullRequestsLabelCandidates: "pullRequests.labelCandidates",
   pullRequestsSetLabels: "pullRequests.setLabels",
+
+  // Issue tracking methods
+  issuesList: "issues.list",
+  issuesDetail: "issues.detail",
+  issuesComments: "issues.comments",
+  issuesTemplates: "issues.templates",
+  issuesCandidates: "issues.candidates",
+  issuesCreate: "issues.create",
+  issuesComment: "issues.comment",
+  issuesUpdate: "issues.update",
+  issuesSetState: "issues.setState",
+  issuesReact: "issues.react",
+  issuesLinkedThreads: "issues.linkedThreads",
+  issueTrackersList: "issueTrackers.list",
+  issueTrackersConnect: "issueTrackers.connect",
+  issueTrackersBindProject: "issueTrackers.bindProject",
 
   sourceControlLookupRepository: "sourceControl.lookupRepository",
   sourceControlCloneRepository: "sourceControl.cloneRepository",
@@ -1120,6 +1190,13 @@ const WsSubscribeTailnetDevicesRpc = Rpc.make(WS_METHODS.subscribeTailnetDevices
 const WsServerGetSettingsRpc = Rpc.make(WS_METHODS.serverGetSettings, {
   payload: Schema.Struct({}),
   success: ServerSettings,
+  error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
+/** The decision endpoint's key as stored, so a client can share it with its other devices. */
+const WsServerRevealComputerGrounderKeyRpc = Rpc.make(WS_METHODS.serverRevealComputerGrounderKey, {
+  payload: Schema.Struct({}),
+  success: Schema.Struct({ apiKey: SettingsSecretValue }),
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
 });
 
@@ -1559,6 +1636,108 @@ const WsPullRequestsSetLabelsRpc = Rpc.make(WS_METHODS.pullRequestsSetLabels, {
   payload: PullRequestLabelChangeInput,
   success: Schema.Void,
   error: PullRequestRpcError,
+});
+
+const IssueRpcError = Schema.Union([
+  IssueUnavailableError,
+  IssueOperationError,
+  EnvironmentAuthorizationError,
+]);
+
+const WsIssuesListRpc = Rpc.make(WS_METHODS.issuesList, {
+  payload: IssueListInput,
+  success: IssueListResult,
+  error: IssueRpcError,
+});
+
+const WsIssuesDetailRpc = Rpc.make(WS_METHODS.issuesDetail, {
+  payload: IssueRef,
+  success: IssueDetail,
+  error: IssueRpcError,
+});
+
+/** Older comments, one page at a time, past the cursor the detail handed over. */
+const WsIssuesLinkedThreadsRpc = Rpc.make(WS_METHODS.issuesLinkedThreads, {
+  payload: ThreadIssueKey,
+  success: IssueLinkedThreadsResult,
+  error: IssueRpcError,
+});
+
+const WsIssuesCommentsRpc = Rpc.make(WS_METHODS.issuesComments, {
+  payload: IssueCommentsPageInput,
+  success: IssueCommentsPage,
+  error: IssueRpcError,
+});
+
+const WsIssuesTemplatesRpc = Rpc.make(WS_METHODS.issuesTemplates, {
+  payload: IssueScopeRef,
+  success: IssueTemplateList,
+  error: IssueRpcError,
+});
+
+/** Read when a label or assignee picker opens, not with every issue. */
+const WsIssuesCandidatesRpc = Rpc.make(WS_METHODS.issuesCandidates, {
+  payload: IssueScopeRef,
+  success: IssueCandidates,
+  error: IssueRpcError,
+});
+
+const WsIssuesCreateRpc = Rpc.make(WS_METHODS.issuesCreate, {
+  payload: IssueCreateInput,
+  success: IssueCreateResult,
+  error: IssueRpcError,
+});
+
+const WsIssuesCommentRpc = Rpc.make(WS_METHODS.issuesComment, {
+  payload: IssueCommentInput,
+  success: Schema.Void,
+  error: IssueRpcError,
+});
+
+const WsIssuesUpdateRpc = Rpc.make(WS_METHODS.issuesUpdate, {
+  payload: IssueUpdateInput,
+  success: Schema.Void,
+  error: IssueRpcError,
+});
+
+const WsIssuesSetStateRpc = Rpc.make(WS_METHODS.issuesSetState, {
+  payload: IssueSetStateInput,
+  success: Schema.Void,
+  error: IssueRpcError,
+});
+
+const WsIssuesReactRpc = Rpc.make(WS_METHODS.issuesReact, {
+  payload: IssueReactionInput,
+  success: Schema.Void,
+  error: IssueRpcError,
+});
+
+const IssueTrackerRpcError = Schema.Union([
+  IssueTrackerConnectionError,
+  EnvironmentAuthorizationError,
+]);
+
+/** Every standalone tracker this server ships, each with its connection probed afresh. */
+const WsIssueTrackersListRpc = Rpc.make(WS_METHODS.issueTrackersList, {
+  payload: Schema.Struct({}),
+  success: IssueTrackerConnectionList,
+  error: IssueTrackerRpcError,
+});
+
+/**
+ * Verifies the credential against the tracker before storing it; the result is the new status.
+ * A null token disconnects, which also unbinds every project that pointed at the tracker.
+ */
+const WsIssueTrackersConnectRpc = Rpc.make(WS_METHODS.issueTrackersConnect, {
+  payload: IssueTrackerConnectInput,
+  success: IssueTrackerConnection,
+  error: IssueTrackerRpcError,
+});
+
+const WsIssueTrackersBindProjectRpc = Rpc.make(WS_METHODS.issueTrackersBindProject, {
+  payload: IssueTrackerBindProjectInput,
+  success: Schema.Void,
+  error: IssueTrackerRpcError,
 });
 
 const WsSourceControlLookupRepositoryRpc = Rpc.make(WS_METHODS.sourceControlLookupRepository, {
@@ -2113,6 +2292,63 @@ const WsSubscribeDeviceStateRpc = Rpc.make(WS_METHODS.subscribeDeviceState, {
   stream: true,
 });
 
+const WsComputerSubscribeRpc = Rpc.make(WS_METHODS.computerSubscribe, {
+  payload: Schema.Struct({}),
+  success: ComputerSnapshot,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
+const WsComputerStopRpc = Rpc.make(WS_METHODS.computerStop, {
+  payload: ComputerStopInput,
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+});
+
+const WsComputerRespondToApprovalRpc = Rpc.make(WS_METHODS.computerRespondToApproval, {
+  payload: ComputerRespondToApprovalInput,
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+});
+
+const WsComputerAuditTailRpc = Rpc.make(WS_METHODS.computerAuditTail, {
+  payload: ComputerAuditTailInput,
+  success: Schema.Array(Schema.Record(Schema.String, Schema.Unknown)),
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+});
+
+const WsComputerHostConnectRpc = Rpc.make(WS_METHODS.computerHostConnect, {
+  payload: ComputerHostConnectInput,
+  success: ComputerHostFrame,
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+const WsComputerHostRespondRpc = Rpc.make(WS_METHODS.computerHostRespond, {
+  payload: ComputerHostRespondInput,
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+});
+
+const WsComputerHostDecideRpc = Rpc.make(WS_METHODS.computerHostDecide, {
+  payload: ComputerHostDecideInput,
+  success: ComputerAnswers,
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+});
+
+const WsComputerHostAuthorizeRpc = Rpc.make(WS_METHODS.computerHostAuthorize, {
+  payload: ComputerHostAuthorizeInput,
+  success: ComputerGrant,
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+});
+
+const WsComputerHostEventRpc = Rpc.make(WS_METHODS.computerHostEvent, {
+  payload: ComputerHostEventInput,
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+});
+
+const WsComputerHostAccessRpc = Rpc.make(WS_METHODS.computerHostAccess, {
+  payload: ComputerHostAccessInput,
+  error: Schema.Union([ComputerError, EnvironmentAuthorizationError]),
+});
+
 const WsOrchestrationGetCommandReceiptsRpc = Rpc.make(
   ORCHESTRATION_V2_WS_METHODS.getCommandReceipts,
   {
@@ -2533,6 +2769,20 @@ export class RpcScopeAuthorization extends RpcMiddleware.Service<RpcScopeAuthori
 ) {}
 
 export const WsRpcGroup = RpcGroup.make(
+  WsIssuesListRpc,
+  WsIssuesDetailRpc,
+  WsIssuesCommentsRpc,
+  WsIssuesTemplatesRpc,
+  WsIssuesCandidatesRpc,
+  WsIssuesLinkedThreadsRpc,
+  WsIssuesCreateRpc,
+  WsIssuesCommentRpc,
+  WsIssuesUpdateRpc,
+  WsIssuesSetStateRpc,
+  WsIssuesReactRpc,
+  WsIssueTrackersListRpc,
+  WsIssueTrackersConnectRpc,
+  WsIssueTrackersBindProjectRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
@@ -2562,6 +2812,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerGetStorageCleanupReportRpc,
   WsServerGetDatabaseStorageRpc,
   WsServerGetSettingsRpc,
+  WsServerRevealComputerGrounderKeyRpc,
   WsServerReclaimDatabaseSpaceRpc,
   WsServerClearWorktreeSharedPathRpc,
   WsServerGetThreadHistoryTrimRpc,
@@ -2772,6 +3023,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsDeviceDetailRpc,
   WsDeviceActionRpc,
   WsSubscribeDeviceStateRpc,
+  WsComputerSubscribeRpc,
+  WsComputerStopRpc,
+  WsComputerRespondToApprovalRpc,
+  WsComputerAuditTailRpc,
+  WsComputerHostConnectRpc,
+  WsComputerHostRespondRpc,
+  WsComputerHostDecideRpc,
+  WsComputerHostAuthorizeRpc,
+  WsComputerHostEventRpc,
+  WsComputerHostAccessRpc,
   WsSubscribeServerConfigRpc,
   WsSubscribeServerLifecycleRpc,
   WsSubscribeAuthAccessRpc,

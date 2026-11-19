@@ -46,6 +46,7 @@ import * as DesktopAssets from "./app/DesktopAssets.ts";
 import * as DesktopPrimaryPaste from "./app/DesktopPrimaryPaste.ts";
 import * as DesktopBackendConfiguration from "./backend/DesktopBackendConfiguration.ts";
 import * as DesktopBackendPool from "./backend/DesktopBackendPool.ts";
+import * as DesktopComputerHost from "./computer/DesktopComputerHost.ts";
 import * as DesktopLocalEnvironmentAuth from "./backend/DesktopLocalEnvironmentAuth.ts";
 import * as DesktopNetworkInterfaces from "./backend/DesktopNetworkInterfaces.ts";
 import * as DesktopEnvironment from "./app/DesktopEnvironment.ts";
@@ -74,6 +75,7 @@ import * as BrowserImport from "./preview/BrowserImport/BrowserImport.ts";
 import * as LinuxBrowserSecret from "./preview/BrowserImport/LinuxBrowserSecret.ts";
 import * as BrowserSession from "./preview/BrowserSession.ts";
 import * as DesktopBrowserHost from "./preview/DesktopBrowserHost.ts";
+import * as LoopbackTunnel from "./preview/LoopbackTunnel.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PreviewPasskeys from "./preview/Passkeys.ts";
 import * as DesktopWindow from "./window/DesktopWindow.ts";
@@ -171,6 +173,7 @@ const layerDesktopServerExposure = DesktopServerExposure.layer.pipe(
 );
 
 const layerDesktopPreview = PreviewManager.layer.pipe(
+  Layer.provideMerge(LoopbackTunnel.layer),
   Layer.provideMerge(DesktopBrowserHost.layer),
   // IPC needs both services on the same BrowserSession.
   Layer.provideMerge(BrowserImport.layer.pipe(Layer.provide(LinuxBrowserSecret.layer))),
@@ -188,6 +191,7 @@ const layerDesktopSnapShot = DesktopSnapShot.layer.pipe(
   Layer.provideMerge(layerDesktopWindow),
   Layer.provideMerge(layerDesktopFoundation),
 );
+const layerDesktopComputer = DesktopComputerHost.layer.pipe(Layer.provide(layerDesktopWindow));
 const layerDesktopAppActivation = DesktopAppActivation.layer.pipe(
   Layer.provide(layerDesktopWindow),
 );
@@ -214,6 +218,7 @@ const layerDesktopLocalEnvironmentAuth = DesktopLocalEnvironmentAuth.layer.pipe(
 const layerDesktopApplication = Layer.mergeAll(
   DesktopLifecycle.layer,
   layerDesktopAppActivation,
+  layerDesktopComputer,
   DesktopWebLinks.layer,
   DesktopApplicationMenu.layer,
   DesktopLinuxUrlHandler.layer,

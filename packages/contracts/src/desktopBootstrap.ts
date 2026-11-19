@@ -33,9 +33,12 @@ export const DesktopBackendBootstrap = Schema.Struct({
   desktopBrowserFd: Schema.optionalKey(PositiveInt),
   desktopBrowserControlFd: Schema.optionalKey(PositiveInt),
   resourceMonitorPath: Schema.optionalKey(TrimmedNonEmptyString),
+  // The desktop app hosts this computer itself; absent means the server may offer it in process.
+  computerLocalHost: Schema.optionalKey(Schema.Boolean),
 });
 
 export type DesktopBackendBootstrap = typeof DesktopBackendBootstrap.Type;
 
+/** Written to `<t3Home>/runtime` before update shutdown so the backend retains its managed tunnel. */
 export const DESKTOP_UPDATE_IN_PROGRESS_MARKER_FILE = "desktop-update-in-progress";
 export const DESKTOP_UPDATE_IN_PROGRESS_TTL_MS = 60_000;

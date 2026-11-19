@@ -17,6 +17,19 @@ const { Children, mocks } = vi.hoisted(() => ({
   },
 }));
 
+vi.mock("gt-react-native", () => ({
+  msg: (message: string) => message,
+  T: Children,
+  Var: Children,
+  useGT: () => (message: string) => message,
+  useMessages: () => (message: string) => message,
+}));
+vi.mock("./components/AgentGatewaySection", () => ({ AgentGatewaySection: () => null }));
+vi.mock("./components/IssueTrackerSection", () => ({ IssueTrackerSection: () => null }));
+vi.mock("./components/SourceControlProvidersSection", () => ({
+  SourceControlProvidersSection: () => null,
+}));
+vi.mock("../pull-requests/pullRequestGlyphs", () => ({ PullRequestGlyph: {} }));
 vi.mock("react-native", () => ({
   View: Children,
   Alert: { alert: mocks.alert },
@@ -70,6 +83,7 @@ vi.mock("../threads/thread-settings-options", () => ({
 }));
 vi.mock("../../components/ui/ScreenScrollView", () => ({ ScreenScrollView: Children }));
 vi.mock("../../components/ui/AppText", () => ({ AppText: Children }));
+vi.mock("../../components/ui/Chip", () => ({ Chip: () => null }));
 vi.mock("../../components/ui/Button", () => ({
   Button: ({
     label,
@@ -94,6 +108,7 @@ vi.mock("./components/SettingsEnvironmentFilterHeader", () => ({
   }),
 }));
 vi.mock("./components/DatabaseStorageNotice", () => ({ DatabaseStorageNotice: () => null }));
+vi.mock("./components/ComputerUseHostsRow", () => ({ ComputerUseHostsRow: () => null }));
 vi.mock("./components/SettingsSection", () => ({ SettingsSection: Children }));
 vi.mock("../../components/ui/ListChoiceRow", () => ({ ListChoiceRow: () => null }));
 vi.mock("./components/SettingsSwitchRow", () => ({

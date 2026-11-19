@@ -1,6 +1,8 @@
+import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -29,10 +31,13 @@ import { parseBearerToken } from "../auth/EnvironmentAuth.ts";
 import { serverBuildVersion } from "../buildVersion.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ComputerService from "../computer/ComputerService.ts";
 import * as DeviceService from "../device/DeviceService.ts";
 import * as HtmlRender from "../htmlRender/HtmlRender.ts";
 import * as ThreadCommandExecutor from "../orchestration-v2/ThreadCommandExecutor.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
+import * as PullRequestService from "../pullRequest/PullRequestService.ts";
 import * as PullRequestWatchService from "../pullRequest/PullRequestWatchService.ts";
 import { advertisedJsonSchema } from "./advertisedJsonSchema.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
@@ -74,18 +79,27 @@ import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
 import * as ToolSearchHandlers from "./toolkits/toolSearch/handlers.ts";
 import { ToolSearchToolkit } from "./toolkits/toolSearch/tools.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
+import * as IssuesHandlers from "./toolkits/issues/handlers.ts";
+import { IssuesToolkit } from "./toolkits/issues/tools.ts";
 import * as DeviceHandlers from "./toolkits/device/handlers.ts";
 import {
   DeviceScreenshotTool,
   DeviceScreenshotToolkit,
   DeviceStandardToolkit,
 } from "./toolkits/device/tools.ts";
+import * as ComputerHandlers from "./toolkits/computer/handlers.ts";
+import {
+  ComputerLookTool,
+  ComputerLookToolkit,
+  ComputerToolkit,
+} from "./toolkits/computer/tools.ts";
 import * as HtmlHandlers from "./toolkits/html/handlers.ts";
 import { MessageToolkit } from "./toolkits/message/tools.ts";
 import * as MessageHandlers from "./toolkits/message/handlers.ts";
 import { HtmlPreviewTool, HtmlPreviewToolkit, HtmlRenderToolkit } from "./toolkits/html/tools.ts";
 import { MCP_HTTP_PATH } from "../httpCors.ts";
 import { requestUrl } from "../requestUrl.ts";
+import type { ThreadId } from "@t3tools/contracts";
 import { APP_NAME } from "@t3tools/shared/branding";
 
 const mcpResourceMetadataUrl = (request: HttpServerRequest.HttpServerRequest) =>
@@ -160,6 +174,38 @@ const normalizeMcpHttpResponse = (
     ? HttpServerResponse.setStatus(response, 202)
     : response;
 };
+
+// The first protocol is the fallback for clients that offer an unknown version.
+const mcpProtocols = [McpProtocol.v2025_06_18, McpProtocol.v2026_07_28] as const;
+
+/**
+ * Effect answers 400 to a notification a sessionless protocol does not define, because it requires
+ * `_meta` before it checks the method. The Go MCP SDK still sends `notifications/roots/list_changed`
+ * there and closes its connection on that 400. Remove once Effect ignores undefined notifications.
+ */
+const isUndefinedNotification = Effect.fnUntraced(function* (
+  request: HttpServerRequest.HttpServerRequest,
+) {
+  const method = request.headers["mcp-method"];
+  const protocol = mcpProtocols.find(
+    (candidate) => candidate.protocolVersion === request.headers["mcp-protocol-version"],
+  );
+  if (
+    request.method !== "POST" ||
+    protocol?.runtime._tag !== "Stateless" ||
+    !method?.startsWith("notifications/") ||
+    protocol.clientRpcs.requests.has(method)
+  ) {
+    return false;
+  }
+  const message = yield* Effect.orElseSucceed(request.json, () => undefined);
+  return (
+    Predicate.isReadonlyObject(message) &&
+    message.jsonrpc === "2.0" &&
+    message.method === method &&
+    !Predicate.hasProperty(message, "id")
+  );
+});
 
 // Session tokens are `<payload>.<signature>`; registry tokens are a bare base64url secret.
 const looksLikeProviderToken = (token: string) => token.length > 0 && !token.includes(".");
@@ -240,6 +286,24 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     Effect.map((settings) => settings.linkedEnvironmentsEnabled),
     Effect.orElseSucceed(() => false),
   );
+  const pullRequests = yield* Effect.serviceOption(PullRequestService.PullRequestService);
+  const projections = yield* Effect.serviceOption(ProjectionStore.ProjectionStoreV2);
+  // Every request reads it, and a remote added mid-thread shows the tools within a minute.
+  const forgeOfThread = yield* Cache.make({
+    capacity: 1_000,
+    timeToLive: Duration.minutes(1),
+    lookup: (threadId: ThreadId): Effect.Effect<boolean | undefined> =>
+      Option.isNone(pullRequests) || Option.isNone(projections)
+        ? Effect.undefined
+        : projections.value.getThreadShell(threadId).pipe(
+            Effect.flatMap((thread) =>
+              thread === null
+                ? Effect.undefined
+                : pullRequests.value.servesProject(thread.projectId),
+            ),
+            Effect.orElseSucceed(() => undefined),
+          ),
+  });
   const authenticateRequest = Effect.fn("McpHttpServer.authenticateRequest")(function* (
     request: HttpServerRequest.HttpServerRequest,
   ) {
@@ -273,7 +337,11 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     const linkedEnvironments = yield* linksEnabled;
     if (limited.client?.linked === true && !linkedEnvironments) return linkedEnvironmentsOff;
     const origin = Option.getOrUndefined(Option.map(requestUrl(request), (url) => url.origin));
-    return { ...limited, linkedEnvironments, origin };
+    const forge =
+      limited.thread === undefined
+        ? undefined
+        : yield* Cache.get(forgeOfThread, limited.thread.threadId);
+    return { ...limited, linkedEnvironments, origin, ...(forge === undefined ? {} : { forge }) };
   });
   // Untraced: a span here would wrap the tool call; the HTTP server span already covers it.
   return Effect.fnUntraced(function* (httpEffect) {
@@ -282,6 +350,7 @@ const makeMcpAuthMiddleware = Effect.gen(function* () {
     if (request.headers.origin !== undefined) return HttpServerResponse.empty({ status: 403 });
     const admitted = yield* authenticateRequest(request);
     if (HttpServerResponse.isHttpServerResponse(admitted)) return admitted;
+    if (yield* isUndefinedNotification(request)) return HttpServerResponse.empty({ status: 202 });
     return yield* httpEffect.pipe(
       Effect.provideService(McpInvocationContext.McpInvocationContext, admitted),
       Effect.map(normalizeMcpHttpResponse),
@@ -741,11 +810,13 @@ const registerPreviewSnapshot = Effect.fn("McpHttpServer.registerPreviewSnapshot
 });
 
 interface ImageToolResult {
-  readonly screenshot: {
+  /** Absent when a tool that can return an image returned none this time. */
+  readonly screenshot?: {
     readonly mimeType: "image/png";
     readonly data: string;
     readonly width: number;
     readonly height: number;
+    readonly [key: string]: unknown;
   };
   readonly [key: string]: unknown;
 }
@@ -846,25 +917,26 @@ const registerImageTool = Effect.fn("McpHttpServer.registerImageTool")(function*
             onFailure: imageToolFailure(tool.name, operation, failureText),
             onSuccess: ({ encodedResult }) => {
               const { screenshot, ...rest } = encodedResult as ImageToolResult;
-              const metadata = {
-                ...rest,
-                screenshot: {
-                  mimeType: screenshot.mimeType,
-                  width: screenshot.width,
-                  height: screenshot.height,
-                },
-              };
+              const pixels = screenshot === undefined ? undefined : screenshot.data;
+              const metadata =
+                screenshot === undefined
+                  ? rest
+                  : { ...rest, screenshot: { ...screenshot, data: undefined } };
               return Effect.succeed(
                 new McpSchema.CallToolResult({
                   isError: false,
                   structuredContent: metadata,
                   content: [
                     { type: "text", text: JSON.stringify(metadata) },
-                    {
-                      type: "image" as const,
-                      data: new Uint8Array(Buffer.from(screenshot.data, "base64")),
-                      mimeType: screenshot.mimeType,
-                    },
+                    ...(screenshot === undefined || pixels === undefined
+                      ? []
+                      : [
+                          {
+                            type: "image" as const,
+                            data: new Uint8Array(Buffer.from(pixels, "base64")),
+                            mimeType: screenshot.mimeType,
+                          },
+                        ]),
                   ],
                 }),
               );
@@ -901,6 +973,29 @@ const registerDeviceScreenshot = Effect.fn("McpHttpServer.registerDeviceScreensh
         ? `${error.message} Call device_list to check the device state, and device_open if it needs to be reopened.`
         : error.message;
     },
+  );
+});
+
+const registerComputerLook = Effect.fn("McpHttpServer.registerComputerLook")(function* () {
+  const computer = yield* ComputerService.ComputerService;
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const built = yield* decodeAsAdvertised(ComputerLookToolkit);
+  yield* registerImageTool(
+    ComputerLookTool,
+    (payload) =>
+      built
+        .handle("computer_look", payload)
+        .pipe(Stream.unwrap, Stream.run(Sink.last()), Effect.flatMap(Effect.fromOption)),
+    (effect) =>
+      effect.pipe(
+        Effect.provideService(ComputerService.ComputerService, computer),
+        Effect.provideService(ThreadManagementService.ThreadManagementService, threads),
+      ),
+    "look",
+    (error) =>
+      typeof error === "object" && error !== null && "message" in error
+        ? String(error.message)
+        : "Looking at the computer failed.",
   );
 });
 
@@ -1286,6 +1381,8 @@ export const layerPullRequestsToolkit = toolkitRegistration(
   PullRequestsHandlers.layer,
 ).pipe(Layer.provide(PullRequestWatchService.layer));
 
+const layerIssuesToolkit = toolkitRegistration(IssuesToolkit, IssuesHandlers.layer);
+
 const layerDeviceStandardToolkitRegistration = toolkitRegistration(
   DeviceStandardToolkit,
   DeviceHandlers.layerStandard,
@@ -1299,6 +1396,16 @@ const layerDeviceScreenshotRegistration = imageToolRegistration(
 export const layerDeviceToolkit = Layer.mergeAll(
   layerDeviceStandardToolkitRegistration,
   layerDeviceScreenshotRegistration,
+);
+
+const layerComputerToolkitRegistration = toolkitRegistration(
+  ComputerToolkit,
+  ComputerHandlers.layer,
+);
+
+export const layerComputerToolkit = Layer.mergeAll(
+  layerComputerToolkitRegistration,
+  imageToolRegistration(registerComputerLook(), ComputerHandlers.layerLook),
 );
 
 /**
@@ -1322,11 +1429,10 @@ export const layerInProcessMcpServer = McpServer.middleware<{
 
 export const layerMcpTransport = <RA, RE, RR>(registrations: Layer.Layer<RA, RE, RR>) =>
   McpServer.layerHttp({
-    name: "T3 Code",
+    name: APP_NAME,
     version: serverBuildVersion,
     path: MCP_HTTP_PATH,
-    // The first protocol is the fallback for clients that offer an unknown version.
-    protocols: [McpProtocol.v2025_06_18, McpProtocol.v2026_07_28],
+    protocols: mcpProtocols,
     allowSessionTermination: true,
     registrations,
   }).pipe(Layer.provide(layerMcpAuthMiddleware));
@@ -1345,7 +1451,9 @@ export const layerTools = layerInToolNameOrder(
     layerPreviewControlsRegistration,
     layerWorktreeToolkitRegistration,
     layerPullRequestsToolkit,
+    layerIssuesToolkit,
     layerDeviceToolkit,
+    layerComputerToolkit,
     layerHtmlToolkit,
     layerMessageToolkit,
   ),

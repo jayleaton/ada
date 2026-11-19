@@ -84,6 +84,7 @@ import * as NativeChildWorkQuery from "./orchestration-v2/NativeChildWorkQuery.t
 import * as ParentSettlementFollow from "./orchestration-v2/ParentSettlementFollow.ts";
 import * as CommandOutputHub from "./orchestration-v2/CommandOutputHub.ts";
 import * as CodexInstallation from "./provider/CodexInstallation.ts";
+import * as ComputerService from "./computer/ComputerService.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import * as DocumentText from "./provider/DocumentText.ts";
 import * as DirectEndpoints from "./environment/DirectEndpoints.ts";
@@ -117,6 +118,9 @@ import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderSessionManager from "./orchestration-v2/ProviderSessionManager.ts";
 import * as PullRequestReviewGuideService from "./pullRequest/PullRequestReviewGuideService.ts";
+import * as IssueService from "./issue/IssueService.ts";
+import * as ThreadIssueService from "./orchestration-v2/ThreadIssueService.ts";
+import * as IssueTrackerConnections from "./issue/IssueTrackerConnections.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
 import * as PullRequestSyncReactor from "./orchestration-v2/PullRequestSyncReactor.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -887,6 +891,7 @@ it.effect("shell snapshots omit idle children and older settled threads only on 
 
 // Build the production RPC layer; unrelated capabilities fail if this test calls them.
 const layerUnusedConfigRpcServices = Layer.mergeAll(
+  Layer.mock(ComputerService.ComputerService)({}),
   Layer.mock(DocumentText.DocumentText)({}),
   Layer.mock(ServerSecretStore.ServerSecretStore)({}),
   Layer.mock(SecretCheck.SecretCheck)({}),
@@ -938,6 +943,9 @@ const layerUnusedConfigRpcServices = Layer.mergeAll(
   Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({}),
   Layer.mock(PullRequestReviewGuideService.PullRequestReviewGuideService)({}),
   Layer.mock(PullRequestService.PullRequestService)({}),
+  Layer.mock(IssueService.IssueService)({}),
+  Layer.mock(ThreadIssueService.ThreadIssueService)({}),
+  Layer.mock(IssueTrackerConnections.IssueTrackerConnections)({}),
   Layer.mock(PullRequestSyncReactor.PullRequestSyncReactor)({}),
   Layer.mock(RepositoryIdentityResolver.RepositoryIdentityResolver)({}),
   Layer.mock(ResourceTelemetry.ResourceTelemetry)({}),

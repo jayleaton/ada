@@ -1,4 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
+import { msg, useGT } from "gt-react";
 import * as Schema from "effect/Schema";
 import {
   useEffect,
@@ -13,6 +14,7 @@ import { useLocation, useParams, useRouter, type AnyRouter } from "@tanstack/rea
 import { moveWorkspaceFocus, workspaceAreaProps } from "../lib/workspaceFocus";
 import { isCommandPaletteOpen } from "../commandPaletteBus";
 import { isElectron } from "../env";
+import { m } from "../i18n/messages";
 import {
   releaseThreadUndoShortcut,
   threadUndoClaimsShortcut,
@@ -39,6 +41,7 @@ import {
   usePanelNavigationSuppression,
 } from "../panelAnimations";
 import { BackgroundThreadAnnouncer } from "./BackgroundThreadAnnouncer";
+import { ComputerActivityStrip } from "./computer/ComputerActivityStrip";
 import { HistorySwipeNavigation } from "./HistorySwipeNavigation";
 import { useCheckForUpdates } from "./useCheckForUpdates";
 import ThreadSidebar from "./Sidebar";
@@ -68,6 +71,8 @@ import {
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { registerCommands, registerMenuAction } from "../shortcuts/dispatcher";
+import { stopAllComputerTasks } from "../state/computer";
+import { toastManager } from "./ui/toast";
 import { resolveThreadRouteRef } from "../threadRoutes";
 
 const MACOS_TRAFFIC_LIGHTS_LEFT_INSET = "var(--desktop-window-controls-inset, 90px)";
@@ -230,6 +235,24 @@ const MODIFIER_KEYS = new Set(["Alt", "Control", "Meta", "Shift"]);
 // hold must survive whatever that re-renders.
 let heldUndoKey: string | null = null;
 
+// Stops every computer task from any screen, for the `computer.stop` command. It has no default
+// key: a Mac corner stop and the strip's Stop are the everyday ways.
+function registerComputerStopCommand(): () => void {
+  return registerCommands({
+    "computer.stop": (event) => {
+      event.preventDefault();
+      void stopAllComputerTasks().then((failures) => {
+        if (failures.length === 0) return;
+        toastManager.add({
+          type: "error",
+          title: m(msg("Could not stop computer use")),
+          description: failures[0],
+        });
+      });
+    },
+  });
+}
+
 // Undoes the thread actions in the sidebar's notice. Settings and Usage own
 // mod+z while open. Captured so mod+z reaches it before the composer's own
 // undo handler consumes the key.
@@ -305,6 +328,7 @@ function registerAppShellCommands(router: AnyRouter, shellElement: Element): () 
     registerThreadUndoCommands(router, readSidebarVisible),
     registerNavigationHistoryCommands(router),
     registerWorkspaceFocusCommands(router),
+    registerComputerStopCommand(),
     registerPullRequestsEscapeCommand(router),
     registerMenuAction("open-settings", () => {
       if (!/^\/settings(\/|$)/.test(router.state.location.pathname))
@@ -317,6 +341,7 @@ function registerAppShellCommands(router: AnyRouter, shellElement: Element): () 
 }
 
 function SidebarControl({ showSidebar }: { readonly showSidebar: boolean }) {
+  const gt = useGT();
   const router = useRouter();
   const usagePageOpen = useLocation({ select: (location) => location.pathname === "/usage" });
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
@@ -393,12 +418,14 @@ function SidebarControl({ showSidebar }: { readonly showSidebar: boolean }) {
                   "pointer-events-auto",
                   isSidebarVisible && stageBackdropVariant && "relative top-auto translate-y-0",
                 )}
-                aria-label="Toggle main sidebar"
+                aria-label={gt("Toggle main sidebar")}
               />
             }
           />
           <TooltipPopup side="bottom">
-            Toggle main sidebar{shortcutLabel ? ` (${shortcutLabel})` : ""}
+            {shortcutLabel
+              ? gt("Toggle main sidebar ({shortcut})", { shortcut: shortcutLabel })
+              : gt("Toggle main sidebar")}
           </TooltipPopup>
         </Tooltip>
       ) : null}
@@ -413,6 +440,7 @@ export function AppSidebarLayout({
   children: ReactNode;
   showSidebar?: boolean;
 }) {
+  const gt = useGT();
   const router = useRouter();
   const [appShellCommandsRef] = useState(
     () => (node: HTMLDivElement | null) =>
@@ -501,7 +529,7 @@ export function AppSidebarLayout({
               data-app-sidebar=""
               {...sidebarArea}
               role="navigation"
-              aria-label="Threads"
+              aria-label={gt("Threads")}
               resizable={{
                 maxWidth: sidebarMaximumWidth,
                 minWidth: sidebarMinimumWidth,
@@ -520,6 +548,7 @@ export function AppSidebarLayout({
         ) : null}
         {children}
         <BackgroundThreadAnnouncer />
+        <ComputerActivityStrip />
         {!isOnAgents && <SidebarControl showSidebar={showSidebar} />}
         {isElectron ? <HistorySwipeNavigation /> : null}
       </SidebarProvider>

@@ -129,6 +129,8 @@ export const PREVIEW_STATE_CHANGE_CHANNEL = "desktop:preview-state-change";
 export const PREVIEW_POINTER_EVENT_CHANNEL = "desktop:preview-pointer-event";
 export const PREVIEW_OPEN_LINK_CHANNEL = "desktop:preview-open-link";
 export const PREVIEW_FIND_RESULT_CHANNEL = "desktop:preview-find-result";
+export const PREVIEW_TUNNEL_ACCESS_REQUEST_CHANNEL = "desktop:preview-tunnel-access-request";
+export const PREVIEW_TUNNEL_ACCESS_RESOLVE_CHANNEL = "desktop:preview-tunnel-access-resolve";
 
 export const MAC_PERMISSION_HELPER_CHANNEL = "desktop:mac-permission-helper";
 
@@ -148,3 +150,10 @@ export const COMPLETE_LEGACY_LOCAL_STORAGE_CHANNEL = "desktop:complete-legacy-lo
 export const RESTART_AUDIO_SERVICE_CHANNEL = "desktop:restart-audio-service";
 
 export const START_FILE_DRAG_CHANNEL = "desktop:start-file-drag";
+
+export const COMPUTER_HOST_PREPARE_CHANNEL = "desktop:computer-host-prepare";
+export const COMPUTER_HOST_FRAME_CHANNEL = "desktop:computer-host-frame";
+export const COMPUTER_HOST_DISCONNECT_CHANNEL = "desktop:computer-host-disconnect";
+export const COMPUTER_HOST_ANSWER_CHANNEL = "desktop:computer-host-answer";
+export const COMPUTER_HOST_CALL_CHANNEL = "desktop:computer-host-call";
+export const COMPUTER_PERMISSIONS_CHANNEL = "desktop:computer-permissions";

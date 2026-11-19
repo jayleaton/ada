@@ -9,6 +9,7 @@ import { vi } from "vite-plus/test";
 import {
   AuthAccessReadScope,
   AuthAccessWriteScope,
+  AuthComputerApproveScope,
   AuthEnvironmentMaintainScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -162,6 +163,8 @@ describe("command permissions", () => {
     { method: WS_METHODS.serverRotateAgentGatewayToken, scope: AuthAccessWriteScope },
     // A read-only app of the device network opens other members; the server caps the grant.
     { method: WS_METHODS.tailnetDevicesOpenDevice, scope: AuthOrchestrationReadScope },
+    // Answering a consequential step on someone's computer is its own grant.
+    { method: WS_METHODS.computerRespondToApproval, scope: AuthComputerApproveScope },
   ])("requires the destination $scope grant for $method", ({ method, scope }) =>
     Effect.gen(function* () {
       const registry = yield* setup;
@@ -201,6 +204,31 @@ describe("command permissions", () => {
         expect(registry.get(check.permissionAtom(env))).toBe(true);
         yield* check.authorize(registry, env);
       }),
+  );
+
+  it.effect("requires the destination settings grant to connect or bind an issue tracker", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* setup;
+        const connect = createCommandPermissions(runtime, WS_METHODS.issueTrackersConnect);
+        const bind = createCommandPermissions(runtime, WS_METHODS.issueTrackersBindProject);
+        registry.set(sessions(env), AsyncResult.success(grant(true)));
+        expect(registry.get(connect.permissionAtom(env))).toBe(false);
+        expect(registry.get(bind.permissionAtom(env))).toBe(false);
+        registry.set(
+          sessions(env),
+          AsyncResult.success({
+            ...grant(false),
+            scopes: [AuthSettingsWriteScope],
+            permissions: [AuthSettingsWriteScope],
+          }),
+        );
+        expect(registry.get(connect.permissionAtom(env))).toBe(true);
+        expect(registry.get(bind.permissionAtom(env))).toBe(true);
+        yield* connect.authorize(registry, env);
+        yield* bind.authorize(registry, env);
+      }),
+    ),
   );
 
   it.effect.each([WS_METHODS.scheduledTasksDelete, ORCHESTRATION_V2_WS_METHODS.stopWorkflow])(
