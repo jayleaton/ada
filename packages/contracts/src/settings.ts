@@ -9,6 +9,7 @@ import {
 export { AgentSkill } from "./agentSkills.ts";
 import { EasDeviceHostConfigs, SimlockDeviceHostConfigs, SshDeviceHostConfigs } from "./device.ts";
 import { AgentGatewaySettings } from "./mcpGateway.ts";
+import { ComputerApprovalsMode } from "./computer.ts";
 import {
   AuthAccessWriteScope,
   AuthOrchestrationOperateScope,
@@ -35,7 +36,7 @@ import {
 import { UsageLimitSourceId } from "./usageLimitSourceId.ts";
 import { UsageModelFilter } from "./usage.ts";
 import { SecretProviderId, SecretProviderSlug } from "./secretReference.ts";
-import { SettingsSecretValue } from "./settingsSecretValue.ts";
+import { containsSecretReference, SettingsSecretValue } from "./settingsSecretValue.ts";
 import { EnvironmentMachineKind, ThreadEnvMode, WorktreeSubmodules } from "./environment.ts";
 import { KeybindingShortcut } from "./keybindings.ts";
 import {
@@ -531,7 +532,15 @@ export const ClientSettingsSchema = Schema.Struct({
   confirmQuit: QuitConfirmationModeSetting.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_QUIT_CONFIRMATION_MODE)),
   ),
+  /**
+   * Which environments may use this computer. Off by default and per environment, so turning on one
+   * headless box does not offer this Mac to every environment in the window.
+   */
+  computerHostEnvironments: Schema.Record(TrimmedNonEmptyString, Schema.Boolean).pipe(
+    Schema.withDecodingDefault(Effect.succeed({})),
+  ),
   confirmThreadArchive: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  confirmTerminalClose: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   confirmThreadDelete: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   confirmThreadUnpin: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   diffFilesCollapsed: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
@@ -1036,22 +1045,24 @@ export type UsageLimitSourceConfig = typeof UsageLimitSourceConfig.Type;
 export const TextGeneratorKind = Schema.Literals(["openaiCompatible", "anthropic"]);
 export type TextGeneratorKind = typeof TextGeneratorKind.Type;
 
+const isHttpUrl = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    return (
+      (url.protocol === "http:" || url.protocol === "https:") &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    );
+  } catch {
+    return false;
+  }
+};
+
 const TextGeneratorBaseUrl = TrimmedNonEmptyString.check(
   Schema.isMaxLength(2048),
-  Schema.makeFilter((value) => {
-    try {
-      const url = new URL(value);
-      return (
-        (url.protocol === "http:" || url.protocol === "https:") &&
-        !url.username &&
-        !url.password &&
-        !url.search &&
-        !url.hash
-      );
-    } catch {
-      return false;
-    }
-  }),
+  Schema.makeFilter(isHttpUrl),
 );
 
 /** A model API that only generates text. Its key shares the id namespace with provider instances. */
@@ -1063,6 +1074,59 @@ export const TextGeneratorConfig = Schema.Struct({
   enabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
 });
 export type TextGeneratorConfig = typeof TextGeneratorConfig.Type;
+
+/** Who answers a computer-use step's questions. `jev` is the TypeSafe preset; null means the agent answers them in `computer_use`. */
+export const ComputerGrounderKind = Schema.Literals(["jev", "openai-compatible", "systemone"]);
+export type ComputerGrounderKind = typeof ComputerGrounderKind.Type;
+
+/** Jev, TypeSafe's System One model. Its endpoint adds `/v1/systemone`, so the base has no `/v1`. */
+const JEV_GROUNDER_BASE_URL = "https://api.typesafe.ai";
+const JEV_GROUNDER_MODEL = "jev-latest";
+
+/** Empty for the Jev preset, whose endpoint is fixed. */
+const ComputerGrounderBaseUrl = TrimmedString.check(
+  Schema.isMaxLength(2048),
+  Schema.makeFilter((value) => value === "" || isHttpUrl(value)),
+).pipe(Schema.withDecodingDefault(Effect.succeed("")));
+
+/**
+ * A decision endpoint for computer use. It sees control labels and up to 1,500 characters of visible
+ * text, and never writes text; only the text a task was started with is ever typed.
+ */
+export const ComputerGrounderConfig = Schema.Struct({
+  kind: ComputerGrounderKind,
+  baseUrl: ComputerGrounderBaseUrl,
+  /** Empty for the Jev preset. */
+  model: TrimmedString.pipe(Schema.withDecodingDefault(Effect.succeed(""))),
+  apiKey: SettingsSecretValue.pipe(Schema.withDecodingDefault(Effect.succeed("")), secretSetting),
+});
+export type ComputerGrounderConfig = typeof ComputerGrounderConfig.Type;
+
+/** The endpoint a stored grounder resolves to. */
+export interface ComputerGrounderEndpoint {
+  readonly kind: "openai-compatible" | "systemone";
+  readonly baseUrl: string;
+  readonly model: string;
+  readonly apiKey: SettingsSecretValue;
+}
+
+/** Fills the Jev preset's URL and model, and needs its key: without one the agent plans the step. */
+export function resolveComputerGrounder(
+  config: ComputerGrounderConfig | null,
+): ComputerGrounderEndpoint | null {
+  if (config === null) return null;
+  if (config.kind === "jev") {
+    if (typeof config.apiKey === "string" && config.apiKey.length === 0) return null;
+    return {
+      kind: "systemone",
+      baseUrl: JEV_GROUNDER_BASE_URL,
+      model: JEV_GROUNDER_MODEL,
+      apiKey: config.apiKey,
+    };
+  }
+  if (config.baseUrl.length === 0 || config.model.length === 0) return null;
+  return { kind: config.kind, baseUrl: config.baseUrl, model: config.model, apiKey: config.apiKey };
+}
 
 export const TextGeneratorModel = Schema.Struct({
   id: TrimmedNonEmptyString,
@@ -1359,6 +1423,8 @@ export const PROJECT_SCOPED_SERVER_SETTING_KEYS = [
   "defaultProjectScripts",
   "enableAgentBrowserAccess",
   "enableAgentDeviceAccess",
+  "enableAgentComputerUse",
+  "computerApprovals",
   "textGenerationModelSelection",
   "threadTitleInstructions",
   "sourceControlWriterModelSelection",
@@ -1397,6 +1463,9 @@ export const ProjectSettingsOverrides = Schema.Struct({
   defaultProjectScripts: Schema.optionalKey(Schema.Array(ProjectScript)),
   enableAgentBrowserAccess: Schema.optionalKey(Schema.Boolean),
   enableAgentDeviceAccess: Schema.optionalKey(Schema.Boolean),
+  enableAgentComputerUse: Schema.optionalKey(Schema.Boolean),
+  /** "skip" grants a consequential step at once and audits it as `approval_skipped`. */
+  computerApprovals: Schema.optionalKey(ComputerApprovalsMode),
   textGenerationModelSelection: Schema.optionalKey(ModelSelection),
   threadTitleInstructions: Schema.optionalKey(TrimmedString),
   sourceControlWriterModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
@@ -1536,6 +1605,11 @@ export const StorageCleanupSettings = Schema.Struct({
 });
 export type StorageCleanupSettings = typeof StorageCleanupSettings.Type;
 
+const UsageHistoryRetentionDays = Schema.Union([
+  Schema.Int.check(Schema.isGreaterThan(0)),
+  Schema.Literal("unlimited"),
+]);
+
 const CloudSpeechCredential = SettingsSecretValue.pipe(
   Schema.withDecodingDefault(Effect.succeed("")),
 );
@@ -1578,6 +1652,8 @@ export const ServerSettings = Schema.Struct({
   agentGateway: Schema.NullOr(AgentGatewaySettings).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),
+  /** Lets clients reach this machine's loopback ports over `/api/preview/tunnel`. */
+  enablePreviewTunnel: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
   cloudSpeechCredentials: CloudSpeechCredentials.pipe(
     Schema.withDecodingDefault(Effect.succeed({ openai: "", xai: "", openrouter: "" })),
   ),
@@ -1625,6 +1701,20 @@ export const ServerSettings = Schema.Struct({
   projectSettingsFolded: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 
   enableAgentDeviceAccess: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Computer use is opt-in per project; the tools answer with how to turn it on. */
+  enableAgentComputerUse: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  /** Read at each step, so changing it applies to a task already running. */
+  computerApprovals: ComputerApprovalsMode.pipe(
+    Schema.withDecodingDefault(Effect.succeed("ask" as const)),
+  ),
+  /** Null: the agent answers each step's questions in `computer_use`. */
+  computerGrounder: Schema.NullOr(ComputerGrounderConfig).pipe(
+    Schema.withDecodingDefault(Effect.succeed(null)),
+  ),
+  /** When `computerGrounder` was last saved, set or cleared; the latest save wins on every device. */
+  computerGrounderSetAt: Schema.String.check(Schema.isMaxLength(64)).pipe(
+    Schema.withDecodingDefault(Effect.succeed("")),
+  ),
   /** Enabling the Device panel must not grant providers device control. */
   enableDeviceSupport: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   deviceOnboardingCompleted: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
@@ -1789,6 +1879,10 @@ export const ServerSettings = Schema.Struct({
   ),
   secretProviders: Schema.Record(SecretProviderId, SecretProviderConfig).pipe(
     Schema.withDecodingDefault(Effect.succeed({})),
+  ),
+
+  usageHistoryRetentionDays: UsageHistoryRetentionDays.pipe(
+    Schema.withDecodingDefault(Effect.succeed(92)),
   ),
 
   usagePriceOverrides: Schema.Record(TrimmedNonEmptyString, UsageModelPriceOverride).pipe(
@@ -2056,6 +2150,7 @@ export const ServerSettingsPatch = Schema.Struct({
   keepAwakeWhileAgentsWork: Schema.optionalKey(Schema.Boolean),
   enableAgentBrowserAccess: Schema.optionalKey(Schema.Boolean),
   agentGateway: Schema.optionalKey(Schema.NullOr(AgentGatewaySettings)),
+  enablePreviewTunnel: Schema.optionalKey(Schema.Boolean),
   cloudSpeechCredentials: Schema.optionalKey(
     Schema.Struct({
       openai: Schema.optionalKey(SettingsSecretValue),
@@ -2097,6 +2192,10 @@ export const ServerSettingsPatch = Schema.Struct({
     ),
   ),
   enableAgentDeviceAccess: Schema.optionalKey(Schema.Boolean),
+  enableAgentComputerUse: Schema.optionalKey(Schema.Boolean),
+  computerApprovals: Schema.optionalKey(ComputerApprovalsMode),
+  computerGrounder: Schema.optionalKey(Schema.NullOr(ComputerGrounderConfig)),
+  computerGrounderSetAt: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(64))),
   enableDeviceSupport: Schema.optionalKey(Schema.Boolean),
   deviceOnboardingCompleted: Schema.optionalKey(Schema.Boolean),
   deviceHosts: Schema.optionalKey(SshDeviceHostConfigs),
@@ -2188,6 +2287,8 @@ export const ServerSettingsPatch = Schema.Struct({
     Schema.Record(SecretProviderId, Schema.NullOr(SecretProviderConfigWrite)),
   ),
 
+  usageHistoryRetentionDays: Schema.optionalKey(UsageHistoryRetentionDays),
+
   usagePriceOverrides: Schema.optionalKey(
     Schema.Record(TrimmedNonEmptyString, Schema.NullOr(UsageModelPriceOverride)),
   ),
@@ -2212,7 +2313,7 @@ export function requiredScopesForServerSettingsPatch(
   for (const [key, value] of Object.entries(patch)) {
     if (value === undefined) continue;
     // Outside agents reach this environment through the gateway, as through a pairing link.
-    if (key === "agentGateway") {
+    if (key === "agentGateway" || key === "enablePreviewTunnel") {
       changesAccess = true;
     } else if (
       key === "providers" ||
@@ -2226,6 +2327,8 @@ export function requiredScopesForServerSettingsPatch(
       changesSettings = true;
     }
   }
+  // A reference can name any secret the store holds; choosing where one goes is provider authority.
+  if (containsSecretReference(patch)) changesProviders = true;
   // Removing a secret provider also clears the settings fields that read from it.
   if (Object.values(patch.secretProviders ?? {}).some((entry) => entry === null)) {
     changesSettings = true;
@@ -2274,8 +2377,12 @@ export const ClientSettingsPatch = Schema.Struct({
   browserDefaultProfileId: Schema.optionalKey(BrowserProfileId),
   confirmQuit: Schema.optionalKey(QuitConfirmationMode),
   confirmThreadArchive: Schema.optionalKey(Schema.Boolean),
+  confirmTerminalClose: Schema.optionalKey(Schema.Boolean),
   confirmThreadDelete: Schema.optionalKey(Schema.Boolean),
   confirmThreadUnpin: Schema.optionalKey(Schema.Boolean),
+  computerHostEnvironments: Schema.optionalKey(
+    Schema.Record(TrimmedNonEmptyString, Schema.Boolean),
+  ),
   diffFilesCollapsed: Schema.optionalKey(Schema.Boolean),
   diffIgnoreWhitespace: Schema.optionalKey(Schema.Boolean),
   diffLayout: Schema.optionalKey(DiffLayout),

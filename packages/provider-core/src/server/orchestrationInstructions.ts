@@ -23,7 +23,7 @@ For independent implementation or a PR stack in its own worktree, use \`t3_threa
 Use \`create_threads\` only for a batch of threads intentionally sharing the caller's checkout: it always inherits the caller's project, branch, and worktree. Asking an agent to run \`git worktree add\` or \`cd\` in its prompt does not update ${APP_NAME}'s thread binding. Select the workspace in the launch call instead. \`t3_worktree_handoff\` moves the calling thread, not another thread, and cannot move a thread already attached to a worktree.`,
   `Tool names may include a harness-normalized MCP prefix, such as \`mcp__t3_code__delegate_task\`; the semantics are the same. Some harnesses attach optional MCP servers lazily: if an initial tool-catalog scan does not show ${APP_NAME} tools, do not conclude that cross-provider delegation is unavailable. Make one bounded direct attempt using the known ${APP_NAME} tool name on the next tool step. In Codex code mode, for example, call \`tools.mcp__t3_code__orchestrator_capabilities({})\` before reporting that the capability is absent. Keep polling/wait loops bounded, do not duplicate active work, and use stable \`clientRequestId\` values when retrying tools that accept them.
 
-ACP fallback: some ACP agents accept the injected MCP server but fail to expose its tools. When the ${APP_NAME} tools are absent and \`T3_ACP_MCP_NODE\` is present, call the same tools through the terminal: \`ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" \${T3_ACP_MCP_ENTRYPOINT:+"$T3_ACP_MCP_ENTRYPOINT"} acp-mcp-call orchestrator_capabilities '{}'\` (\`T3_ACP_MCP_ENTRYPOINT\` is unset when ${APP_NAME} runs as a standalone executable). Delegate with \`acp-mcp-call delegate_task '{"task":"...","target":{"providerInstanceId":"...","model":"..."},"mode":"async","clientRequestId":"..."}'\`. This is the supported ${APP_NAME} transport fallback, not an ordinary shell-based substitute for delegation.
+ACP fallback: some ACP agents accept the injected MCP server but expose only some or none of its tools. When an ${APP_NAME} tool you need is absent and \`T3_ACP_MCP_NODE\` is present, call the same tools through the terminal: \`ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" \${T3_ACP_MCP_ENTRYPOINT:+"$T3_ACP_MCP_ENTRYPOINT"} acp-mcp-call orchestrator_capabilities '{}'\` (\`T3_ACP_MCP_ENTRYPOINT\` is unset when ${APP_NAME} runs as a standalone executable). Delegate with \`acp-mcp-call delegate_task '{"task":"...","target":{"providerInstanceId":"...","model":"..."},"mode":"async","clientRequestId":"..."}'\`. This is the supported ${APP_NAME} transport fallback, not an ordinary shell-based substitute for delegation.
 
 ### Showing visuals
 
@@ -62,6 +62,33 @@ export const T3_CODE_DEVICE_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH = deviceToolInstr
   ` Load them with ToolSearch \`select:${T3_CODE_DEVICE_TOOLS.map((tool) => `mcp__t3-code__${tool}`).join(",")}\`.`,
 );
 
+const T3_CODE_COMPUTER_TOOLS = [
+  "computer_status",
+  "computer_look",
+  "computer_act",
+  "computer_control",
+  "computer_use",
+  "computer_stop",
+];
+
+const computerToolInstructions = (loadTools: string) => `## ${APP_NAME} computer use
+
+For something on the user's own Mac rather than in the checkout (clicking through a native app, reading a window only that app shows, filling a form in their browser), use the computer tools, not \`osascript\`, AppleScript, \`open\` or \`screencapture\` in the shell.${loadTools}
+Drive it yourself whenever you can decide the next step: \`computer_look\` reads the window (controls with refs, visible text, an open \`popup\`, and \`loading\` if the page never settled), \`computer_act\` takes one step (click, type the exact \`text\`, a key, scroll, \`open_url\`), then look again before the next.
+\`computer_use\` hands a goal to a small decision model that sees only the current screen; use it for steps you cannot see ahead, and brief it like that model: one screen or sub-goal per task, the visible control or label to act on, getting to a page kept apart from what to read there (read that yourself with \`computer_look\`), any words to type in \`text\` (\`goal\` types nothing), and what the screen shows once it is done. \`computer_control\` is for the fixed actions only: open or quit an app, volume, media, dark mode, and locking the screen.
+A task that comes back with questions wants \`taskId\`, \`decisionId\` and \`answers\`, each choosing one of the keys it offered, with a confidence of high, medium or low; never invent a key. When a step waits for the user's approval, wait for them or report it: you cannot approve it, and working around it fails. When a task ends \`blocked\` or \`stuck\`, stop and say why instead of starting it again. \`computer_status\` follows a running task and \`computer_stop\` ends one.
+A site the user is signed in to is computer work in their default browser: never pick a browser by name unless the user did. \`open_url\` switches to a tab already on the site, or opens one, and waits for the page to load.
+On a sign-in page, try what the browser saved once: click the username or email field, press \`down\` if no \`popup\` came back, and click the saved account's line by its exact text as \`label\`. When no account is offered or nothing fills in, stop and ask the user to sign in in that browser, then continue. Never ask for a password or type one from chat; stop at a two-factor code too.
+Any other page the preview browser can open is preview work, not computer work, and a change in the checkout needs neither.`;
+
+/** Computer guidance for sessions holding the `computer` capability. */
+export const T3_CODE_COMPUTER_TOOL_INSTRUCTIONS = computerToolInstructions("");
+
+/** Claude Code defers MCP tools behind ToolSearch, so Claude's copy says how to load them. */
+export const T3_CODE_COMPUTER_TOOL_INSTRUCTIONS_WITH_TOOL_SEARCH = computerToolInstructions(
+  ` Load them with ToolSearch \`select:${T3_CODE_COMPUTER_TOOLS.map((tool) => `mcp__t3-code__${tool}`).join(",")}\`.`,
+);
+
 // ACP only: some ACP agents accept the injected MCP server but never expose
 // its tools, so they need the terminal transport other harnesses never use.
 const T3_CODE_ACP_MCP_FALLBACK_INSTRUCTIONS = `ACP fallback: if the ${APP_NAME} tools are absent and \`T3_ACP_MCP_NODE\` is present, call them through the terminal: \`ELECTRON_RUN_AS_NODE=1 "$T3_ACP_MCP_NODE" \${T3_ACP_MCP_ENTRYPOINT:+"$T3_ACP_MCP_ENTRYPOINT"} acp-mcp-call orchestrator_capabilities '{}'\` (\`T3_ACP_MCP_ENTRYPOINT\` is unset for a standalone executable). Delegate with \`acp-mcp-call delegate_task '{"task":"...","target":{"providerInstanceId":"...","model":"..."},"mode":"async","clientRequestId":"..."}'\`.`;
@@ -78,6 +105,7 @@ export interface T3AcpInstructionState {
   readonly interactionMode: ProviderInteractionMode;
   readonly hasT3Mcp: boolean;
   readonly hasDeviceTools: boolean;
+  readonly hasComputerTools: boolean;
 }
 
 /** ACP lacks system/developer fields; inject context on first prompt and tool/mode changes. */
@@ -91,7 +119,8 @@ export function t3AcpPromptWithInstructions(input: {
   if (
     input.previousState?.interactionMode === input.state.interactionMode &&
     input.previousState.hasT3Mcp === input.state.hasT3Mcp &&
-    input.previousState.hasDeviceTools === input.state.hasDeviceTools
+    input.previousState.hasDeviceTools === input.state.hasDeviceTools &&
+    input.previousState.hasComputerTools === input.state.hasComputerTools
   ) {
     return input.prompt;
   }
@@ -103,18 +132,27 @@ export function t3AcpPromptWithInstructions(input: {
       ? [
           T3_CODE_BROWSER_TOOL_INSTRUCTIONS.trim(),
           ...(input.state.hasDeviceTools ? [T3_CODE_DEVICE_TOOL_INSTRUCTIONS] : []),
+          ...(input.state.hasComputerTools ? [T3_CODE_COMPUTER_TOOL_INSTRUCTIONS] : []),
           T3_CODE_ORCHESTRATION_INSTRUCTIONS.trim(),
           T3_CODE_ACP_MCP_FALLBACK_INSTRUCTIONS,
         ]
       : []),
   ];
-  return `<t3_code_instructions>\n${instructions.join("\n\n")}\n</t3_code_instructions>\n\n<user_request>\n${input.prompt}\n</user_request>`;
+  return `<t3_code_instructions>\n${instructions.flat().join("\n\n")}\n</t3_code_instructions>\n\n<user_request>\n${input.prompt}\n</user_request>`;
 }
 
-const orchestrationInstructions = (hasDeviceTools: boolean) =>
-  hasDeviceTools
-    ? `${T3_CODE_ORCHESTRATION_INSTRUCTIONS}\n${T3_CODE_DEVICE_TOOL_INSTRUCTIONS}\n`
-    : T3_CODE_ORCHESTRATION_INSTRUCTIONS;
+const orchestrationInstructions = (input: {
+  readonly hasDeviceTools: boolean;
+  readonly hasComputerTools: boolean;
+}) => {
+  const extra = [
+    ...(input.hasDeviceTools ? [T3_CODE_DEVICE_TOOL_INSTRUCTIONS] : []),
+    ...(input.hasComputerTools ? [T3_CODE_COMPUTER_TOOL_INSTRUCTIONS] : []),
+  ];
+  return extra.length === 0
+    ? T3_CODE_ORCHESTRATION_INSTRUCTIONS
+    : `${T3_CODE_ORCHESTRATION_INSTRUCTIONS}\n${extra.join("\n\n")}\n`;
+};
 
 function prependT3OrchestrationInstructions(prompt: string, instructions: string): string {
   return `<t3_code_orchestration_instructions>${instructions.trim()}</t3_code_orchestration_instructions>\n\n<user_request>\n${prompt}\n</user_request>`;
@@ -125,24 +163,39 @@ export function t3OrchestrationPrompt(input: {
   readonly prompt: string;
   readonly hasT3Mcp: boolean;
   readonly hasDeviceTools: boolean;
+  readonly hasComputerTools: boolean;
   readonly orchestrationDelivered: boolean;
   readonly deviceInstructionsDelivered: boolean;
+  readonly computerInstructionsDelivered: boolean;
+  /** Guidance for this provider's own tools, sent until `providerInstructionsDelivered`. */
+  readonly providerInstructions?: string;
+  readonly providerInstructionsDelivered?: boolean;
 }): string {
   if (!input.hasT3Mcp) return input.prompt;
-  if (!input.orchestrationDelivered) {
-    return prependT3OrchestrationInstructions(
-      input.prompt,
-      orchestrationInstructions(input.hasDeviceTools),
-    );
-  }
-  return input.hasDeviceTools && !input.deviceInstructionsDelivered
-    ? prependT3OrchestrationInstructions(input.prompt, T3_CODE_DEVICE_TOOL_INSTRUCTIONS)
-    : input.prompt;
+  const instructions = [
+    ...(!input.orchestrationDelivered
+      ? [orchestrationInstructions(input)]
+      : [
+          ...(input.hasDeviceTools && !input.deviceInstructionsDelivered
+            ? [T3_CODE_DEVICE_TOOL_INSTRUCTIONS]
+            : []),
+          ...(input.hasComputerTools && !input.computerInstructionsDelivered
+            ? [T3_CODE_COMPUTER_TOOL_INSTRUCTIONS]
+            : []),
+        ]),
+    ...(input.providerInstructionsDelivered === true || input.providerInstructions === undefined
+      ? []
+      : [input.providerInstructions]),
+  ].map((part) => part.trim());
+  return instructions.length === 0
+    ? input.prompt
+    : prependT3OrchestrationInstructions(input.prompt, instructions.join("\n\n"));
 }
 
 export function t3OrchestrationSystemPrompt(
   hasT3Mcp: boolean,
   hasDeviceTools: boolean,
+  hasComputerTools = false,
 ): string | undefined {
-  return hasT3Mcp ? orchestrationInstructions(hasDeviceTools) : undefined;
+  return hasT3Mcp ? orchestrationInstructions({ hasDeviceTools, hasComputerTools }) : undefined;
 }

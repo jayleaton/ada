@@ -22,7 +22,7 @@ import { isElectron } from "~/env";
 import { networkMembers } from "~/state/networkMembers";
 import { mintPairingCodeOn } from "~/state/peerPairingCode";
 import { peerLinkEnvironment, useLinkableMachines, useNetworkHosts } from "~/state/peerLinks";
-import type { EnvironmentPresentation } from "~/state/environments";
+import { type EnvironmentPresentation, useEnvironments } from "~/state/environments";
 import { useEnvironmentScope, usePreparedConnection } from "~/state/session";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { Button } from "../ui/button";
@@ -40,6 +40,7 @@ import { Menu, MenuItem, MenuPopup, MenuTrigger } from "../ui/menu";
 import { Input } from "../ui/input";
 import { stackedThreadToast, toastManager } from "../ui/toast";
 import { LinkAccessPicker } from "./LinkAccessPicker";
+import { LinkSeveralEnvironmentsAction } from "./LinkSeveralEnvironments";
 import { LinkAddressWarning, LinkMachineSelect } from "./LinkMachineSelect";
 import {
   DeviceMachineRow,
@@ -50,7 +51,7 @@ import {
 } from "./NetworkRows";
 import type { SavedMachineNetwork } from "./SavedEnvironmentRows";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
-import { searchableSetting } from "./settingsSearch";
+import { useSearchableSetting } from "./settingsSearch";
 
 const failureToast = (title: string, description: string) =>
   toastManager.add(stackedThreadToast({ type: "error", title, description }));
@@ -118,6 +119,7 @@ export function MachinesSettings({
     );
   });
   const outside = savedEnvironments.filter((environment) => !shown.has(environment.environmentId));
+  const searchableSetting = useSearchableSetting();
   const search = searchableSetting("machines");
   return (
     <>
@@ -193,7 +195,15 @@ const managedBy = (environment: EnvironmentPresentation) => {
 
 function LinkHeaderAction({ environmentId }: { readonly environmentId: EnvironmentId }) {
   const canLink = useAtomValue(peerLinkEnvironment.link.permissionAtom(environmentId));
-  return canLink ? <LinkEnvironmentAction environmentId={environmentId} /> : null;
+  // A batch needs at least two other machines this app has saved.
+  const otherMachines = useEnvironments().environments.length - 1;
+  if (!canLink) return null;
+  return (
+    <div className="flex items-center gap-2">
+      {otherMachines > 1 ? <LinkSeveralEnvironmentsAction environmentId={environmentId} /> : null}
+      <LinkEnvironmentAction environmentId={environmentId} />
+    </div>
+  );
 }
 
 function LinkEnvironmentAction({ environmentId }: { readonly environmentId: EnvironmentId }) {

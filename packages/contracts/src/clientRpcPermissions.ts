@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { GitPreparePullRequestThreadInput, GitRunStackedActionInput } from "./git.ts";
 import {
   AuthAccessWriteScope,
+  AuthComputerApproveScope,
   AuthEnvironmentMaintainScope,
   AuthOrchestrationOperateScope,
   AuthOrchestrationReadScope,
@@ -45,6 +46,14 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.pullRequestsSetFilesViewed]: AuthSourceControlWriteScope,
   [WS_METHODS.pullRequestsRequestReviewers]: AuthSourceControlWriteScope,
   [WS_METHODS.pullRequestsSetLabels]: AuthSourceControlWriteScope,
+  [WS_METHODS.issuesCreate]: AuthSourceControlWriteScope,
+  [WS_METHODS.issuesComment]: AuthSourceControlWriteScope,
+  [WS_METHODS.issuesUpdate]: AuthSourceControlWriteScope,
+  [WS_METHODS.issuesSetState]: AuthSourceControlWriteScope,
+  [WS_METHODS.issuesReact]: AuthSourceControlWriteScope,
+  // A tracker credential and a project's binding are settings, saved under the same grant.
+  [WS_METHODS.issueTrackersConnect]: AuthSettingsWriteScope,
+  [WS_METHODS.issueTrackersBindProject]: AuthSettingsWriteScope,
   // Writing a guide runs a model on this environment's providers, which reading one does not.
   [WS_METHODS.pullRequestsGenerateReviewGuide]: AuthOrchestrationOperateScope,
   [WS_METHODS.projectsCreateFromThread]: AuthOrchestrationOperateScope,
@@ -94,11 +103,15 @@ export const CLIENT_GUARDED_RPC_SCOPES = {
   [WS_METHODS.serverUpdateAgentGateway]: AuthAccessWriteScope,
   [WS_METHODS.serverRevealAgentGatewayToken]: AuthAccessWriteScope,
   [WS_METHODS.serverRotateAgentGatewayToken]: AuthAccessWriteScope,
+  // Reads a stored credential, as revealing the gateway token does.
+  [WS_METHODS.serverRevealComputerGrounderKey]: AuthAccessWriteScope,
   // A push carries only thread titles and states that a reader already sees.
   [WS_METHODS.pushRegistrationsRegister]: AuthOrchestrationReadScope,
   [WS_METHODS.pushRegistrationsUnregister]: AuthOrchestrationReadScope,
   // A session on another member, never past the caller's own grant; the server decides who may.
   [WS_METHODS.tailnetDevicesOpenDevice]: AuthOrchestrationReadScope,
+  // Answering a consequential step on someone's computer is its own grant.
+  [WS_METHODS.computerRespondToApproval]: AuthComputerApproveScope,
 } as const;
 export type ClientGuardedRpcTag = keyof typeof CLIENT_GUARDED_RPC_SCOPES;
 

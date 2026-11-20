@@ -71,6 +71,7 @@ import {
 import * as ServerSecretStore from "./auth/ServerSecretStore.ts";
 import * as ManagedPolicy from "./policy/ManagedPolicy.ts";
 import { secretProviderDefinitions } from "./secrets/secretProviderDefinitions.ts";
+import { watchDirectoryReplacements } from "./watchDirectoryReplacements.ts";
 import {
   readSecretFieldValues,
   sourceControlHostSecretName,
@@ -80,6 +81,7 @@ import {
   mapSettingsSecrets,
   mapSettingsSecretValues,
   withoutRemovedSecretProviderReferences,
+  withoutRedirectedSimlockTokens,
   SECRET_REDACTED,
   type SettingsSecret,
 } from "./settingsSecrets.ts";
@@ -400,7 +402,10 @@ const makeTest = Effect.fn("serverSettings.makeTest")(function* (
             currentSettings,
             withServerOwnedMcpGatewayProfiles(
               currentSettings,
-              withUniqueMcpGatewayProfileNames(currentSettings, patch),
+              withUniqueMcpGatewayProfileNames(
+                currentSettings,
+                withComputerGrounderSetAt(currentSettings, patch, now, replicateProfiles),
+              ),
               now,
               replicateProfiles,
             ),
@@ -629,6 +634,31 @@ function withUniqueMcpGatewayProfileNames(
       kept(profile) ? profile : { ...profile, name: claimAgentName(profile.name, taken) },
     ),
   };
+}
+
+/**
+ * A local save of the decision endpoint is stamped later than the one it replaces, so it wins
+ * on every device; a replicated save applies only when it is at least as new as the stored one.
+ */
+function withComputerGrounderSetAt(
+  current: ServerSettings,
+  patch: ServerSettingsPatch,
+  now: string,
+  replicated: boolean,
+): ServerSettingsPatch {
+  const { computerGrounder, computerGrounderSetAt, ...rest } = patch;
+  if (computerGrounder === undefined) return rest;
+  if (replicated)
+    return computerGrounderSetAt !== undefined &&
+      computerGrounderSetAt >= current.computerGrounderSetAt
+      ? patch
+      : rest;
+  const setAt = DateTime.formatIso(
+    DateTime.makeUnsafe(
+      Math.max(Date.parse(now), (Date.parse(current.computerGrounderSetAt) || 0) + 1),
+    ),
+  );
+  return { ...rest, computerGrounder, computerGrounderSetAt: setAt };
 }
 
 /** Later than every stored library timestamp, so a write always wins its own merge. */
@@ -1230,7 +1260,11 @@ const make = Effect.gen(function* () {
       if (decoded._tag === "Failure" || legacySettings._tag === "Failure") {
         const failure = decoded._tag === "Failure" ? decoded : legacySettings;
         // The file may hold an opt-out we can no longer read; never resume threads on a guess.
-        settings = { ...managed.defaults, continueThreadsAfterServerUpdate: false };
+        settings = {
+          ...managed.defaults,
+          continueThreadsAfterServerUpdate: false,
+          usageHistoryRetentionDays: "unlimited",
+        };
         if (failure._tag === "Failure") {
           parseFailure = Option.some(Cause.squash(failure.cause));
           yield* Effect.logWarning("failed to parse settings.json, using defaults", {
@@ -1623,7 +1657,10 @@ const make = Effect.gen(function* () {
         }
         // An older client echoes a reference as the redacted marker; restore it before vetting so
         // a removed provider's reference is cleared below rather than restored by persistence.
-        const updated = withEchoedSecretReferences(current, yield* update(current));
+        const updated = withoutRedirectedSimlockTokens(
+          current,
+          withEchoedSecretReferences(current, yield* update(current)),
+        );
         // Vet before secrets: a variable the policy hides from clients is not one they removed.
         const vetted = managed.vetWrite(current, yield* normalizeServerSettings(updated), patch);
         if (vetted._tag === "Locked") {
@@ -1693,21 +1730,45 @@ const make = Effect.gen(function* () {
     }),
   );
 
-  const watchFileChanges = (filePath: string) => {
+  // `ready` completes once the watch is registered, or once it fails to be.
+  const watchFileChanges = (filePath: string, ready: Deferred.Deferred<void>) => {
     const directory = pathService.dirname(filePath);
     const fileName = pathService.basename(filePath);
     const resolvedFilePath = pathService.resolve(filePath);
-    return fs
-      .watch(directory)
-      .pipe(
-        Stream.filter(
-          (event) =>
-            event.path === fileName ||
-            event.path === filePath ||
-            pathService.resolve(directory, event.path) === resolvedFilePath,
-        ),
-      );
+    const markReady = () => Deferred.doneUnsafe(ready, Exit.void);
+    return fs.watch(directory, { onReady: markReady }).pipe(
+      Stream.filter(
+        (event) =>
+          event.path === fileName ||
+          event.path === filePath ||
+          pathService.resolve(directory, event.path) === resolvedFilePath,
+      ),
+      Stream.as(undefined),
+      Stream.ensuring(Effect.sync(markReady)),
+    );
   };
+
+  // A directory watch follows the directory's inode, so when the target's
+  // directory is renamed away and another takes its path, watch the new one.
+  const watchLinkTargetChanges = (linkTargetPath: string, ready: Deferred.Deferred<void>) =>
+    watchDirectoryReplacements(
+      (parentReady) => watchFileChanges(pathService.dirname(linkTargetPath), parentReady),
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const registered = yield* Deferred.make<void>();
+          return Stream.merge(
+            watchFileChanges(linkTargetPath, registered).pipe(Stream.ignoreCause({ log: true })),
+            // Startup reloads once ready. Later watches trigger their own reload.
+            Stream.fromEffect(
+              Deferred.await(registered).pipe(Effect.andThen(Deferred.succeed(ready, undefined))),
+            ).pipe(
+              Stream.filter((completedStartup) => !completedStartup),
+              Stream.as(undefined),
+            ),
+          );
+        }),
+      ),
+    );
 
   const startWatcher = Effect.gen(function* () {
     const settingsDir = pathService.dirname(settingsPath);
@@ -1740,30 +1801,44 @@ const make = Effect.gen(function* () {
       return Option.some(linkTargetPath);
     }).pipe(Effect.orElseSucceed(() => Option.none<string>()));
 
-    const initialLinkTarget = yield* watchLinkTarget;
-    const linkTargetEvents = Stream.make(initialLinkTarget).pipe(
-      Stream.concat(watchFileChanges(settingsPath).pipe(Stream.mapEffect(() => watchLinkTarget))),
-      Stream.changes,
-      Stream.switchMap(
-        Option.match({
-          onNone: () => Stream.empty,
-          onSome: (linkTargetPath) =>
-            watchFileChanges(linkTargetPath).pipe(Stream.ignore({ log: true })),
-        }),
-      ),
-    );
+    const settingsReady = yield* Deferred.make<void>();
+    const linkTargetReady = yield* Deferred.make<void>();
+    yield* Effect.gen(function* () {
+      const [settingsEvents, resolveEvents] = yield* watchFileChanges(
+        settingsPath,
+        settingsReady,
+      ).pipe(
+        Stream.ignoreCause({ log: true }),
+        Stream.broadcastN({ n: 2, capacity: 1, strategy: "sliding" }),
+      );
+      // Buffer settings path changes while resolving the first target.
+      const linkTargetEvents = Stream.fromEffect(
+        Deferred.await(settingsReady).pipe(Effect.andThen(watchLinkTarget)),
+      ).pipe(
+        Stream.concat(resolveEvents.pipe(Stream.mapEffect(() => watchLinkTarget))),
+        Stream.changes,
+        Stream.switchMap(
+          Option.match({
+            onNone: () =>
+              Stream.fromEffect(Deferred.succeed(linkTargetReady, undefined)).pipe(Stream.drain),
+            onSome: (linkTargetPath) => watchLinkTargetChanges(linkTargetPath, linkTargetReady),
+          }),
+        ),
+      );
 
-    // Saves emit multiple events; fs.watch may fire before content is flushed.
-    const debouncedSettingsEvents = Stream.merge(
-      watchFileChanges(settingsPath),
-      linkTargetEvents,
-    ).pipe(Stream.debounce(Duration.millis(100)));
-
-    yield* Stream.runForEach(debouncedSettingsEvents, () => revalidateAndEmitSafely).pipe(
+      // Saves emit multiple events; fs.watch may fire before content is flushed.
+      yield* Stream.merge(settingsEvents, linkTargetEvents).pipe(
+        Stream.debounce(Duration.millis(100)),
+        Stream.runForEach(() => revalidateAndEmitSafely),
+      );
+    }).pipe(
+      Effect.scoped,
       Effect.ignoreCause({ log: true }),
+      Effect.ensuring(Deferred.succeed(linkTargetReady, undefined)),
       Effect.forkIn(watcherScope),
-      Effect.asVoid,
     );
+    // Edits made once `start` returns must reach a registered watch.
+    yield* Deferred.await(linkTargetReady);
   });
 
   const start = Effect.gen(function* () {
@@ -1800,7 +1875,10 @@ const make = Effect.gen(function* () {
             current,
             withServerOwnedMcpGatewayProfiles(
               current,
-              withUniqueMcpGatewayProfileNames(current, patch),
+              withUniqueMcpGatewayProfileNames(
+                current,
+                withComputerGrounderSetAt(current, patch, now, replicateProfiles),
+              ),
               now,
               replicateProfiles,
             ),

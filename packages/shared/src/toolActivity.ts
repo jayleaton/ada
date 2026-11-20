@@ -34,6 +34,42 @@ export const COMPUTER_USE_TOOL_SOURCE = {
   kind: "computer",
 } as const;
 
+/** Ada's own computer tools, so the work log reads "Computer use" rather than an integration's name. */
+const COMPUTER_TOOL_SOURCE = {
+  key: "computer",
+  name: "Computer use",
+  kind: "computer",
+} as const;
+
+const COMPUTER_TOOL_NAMES: ReadonlySet<string> = new Set([
+  "computer_act",
+  "computer_look",
+  "computer_control",
+  "computer_use",
+  "computer_status",
+  "computer_stop",
+]);
+
+/** T3's MCP server as each harness names it. Another server's `computer_use` is not Ada's. */
+const T3_MCP_SERVERS: ReadonlySet<string> = new Set([
+  "t3-code",
+  "t3_code",
+  "t3code",
+  "t3-code-direct",
+  "t3_code_direct",
+]);
+
+/**
+ * Ada's computer source for one of its own computer tools, however the harness prefixes it
+ * (`mcp__t3-code__computer_use`, `t3-code.computer_use`); undefined for every other tool.
+ */
+export function computerToolSource(toolName: string | null | undefined, serverName?: string) {
+  if (toolName === null || toolName === undefined) return undefined;
+  if (serverName !== undefined && !T3_MCP_SERVERS.has(serverName.toLowerCase())) return undefined;
+  const bare = toolName.slice(Math.max(toolName.lastIndexOf("."), toolName.lastIndexOf("__")) + 1);
+  return COMPUTER_TOOL_NAMES.has(bare.trim()) ? COMPUTER_TOOL_SOURCE : undefined;
+}
+
 export function dynamicToolSurface(toolName: string | null | undefined, input: unknown) {
   if (toolName === "cua_repl.js") return "computer" as const;
   const code = asRecord(input)?.code;
@@ -44,25 +80,51 @@ export function dynamicToolSurface(toolName: string | null | undefined, input: u
     : undefined;
 }
 
-export function dynamicToolTitle(
+export type DynamicToolTitle =
+  | { readonly kind: "title"; readonly title: string }
+  | { readonly kind: "computer-use" }
+  | { readonly kind: "run-javascript" }
+  | { readonly kind: "skill"; readonly name: string };
+
+export function describeDynamicToolTitle(
   toolName: string | null | undefined,
   input: unknown,
   retainedTitle?: string | null,
-): string | undefined {
+): DynamicToolTitle | undefined {
   if (isJavaScriptReplTool(toolName)) {
     const title = asTrimmedString(retainedTitle);
     const meaningfulTitle =
       title && title.toLowerCase() !== "js" && title.toLowerCase() !== toolName?.toLowerCase()
         ? title
         : undefined;
-    return (
-      asTrimmedString(asRecord(input)?.title) ??
-      meaningfulTitle ??
-      (dynamicToolSurface(toolName, input) === "computer" ? "Computer use" : "Run JavaScript")
-    );
+    const shown = asTrimmedString(asRecord(input)?.title) ?? meaningfulTitle;
+    if (shown) return { kind: "title", title: shown };
+    return dynamicToolSurface(toolName, input) === "computer"
+      ? { kind: "computer-use" }
+      : { kind: "run-javascript" };
   }
   const skill = claudeSkillInvocation(toolName, input);
-  return skill === undefined ? undefined : `Skill: ${skill.name}`;
+  return skill === undefined ? undefined : { kind: "skill", name: skill.name };
+}
+
+export function dynamicToolTitle(
+  toolName: string | null | undefined,
+  input: unknown,
+  retainedTitle?: string | null,
+): string | undefined {
+  const title = describeDynamicToolTitle(toolName, input, retainedTitle);
+  switch (title?.kind) {
+    case undefined:
+      return undefined;
+    case "title":
+      return title.title;
+    case "computer-use":
+      return "Computer use";
+    case "run-javascript":
+      return "Run JavaScript";
+    case "skill":
+      return `Skill: ${title.name}`;
+  }
 }
 
 function recordHasKeys(
@@ -364,13 +426,19 @@ function searchTargetName(value: string | undefined): string | undefined {
   return value.split(/[\\/]/u).findLast((part) => part.length > 0 && part !== ".");
 }
 
+export function searchToolLabelParts(data: Record<string, unknown> | undefined) {
+  const input = searchInputRecord(data);
+  return {
+    query: firstInputString(input, SEARCH_QUERY_KEYS),
+    glob: firstInputString(input, SEARCH_GLOB_KEYS),
+    target: searchTargetName(firstInputString(input, SEARCH_TARGET_KEYS)),
+  };
+}
+
 export function formatSearchToolLabel(
   data: Record<string, unknown> | undefined,
 ): string | undefined {
-  const input = searchInputRecord(data);
-  const query = firstInputString(input, SEARCH_QUERY_KEYS);
-  const glob = firstInputString(input, SEARCH_GLOB_KEYS);
-  const target = searchTargetName(firstInputString(input, SEARCH_TARGET_KEYS));
+  const { query, glob, target } = searchToolLabelParts(data);
   if (query && target) {
     return `Searched ${query} in ${target}`;
   }

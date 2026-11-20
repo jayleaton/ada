@@ -37,7 +37,9 @@ import * as ContextHandoffService from "../ContextHandoffService.ts";
 import * as EffectOutbox from "../EffectOutbox.ts";
 import * as SettlementCascade from "../SettlementCascade.ts";
 import * as EffectWorker from "../EffectWorker.ts";
+import * as ComputerService from "../../computer/ComputerService.ts";
 import * as EventSink from "../EventSink.ts";
+import * as ThreadViewers from "../ThreadViewers.ts";
 import * as EventStore from "../EventStore.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as Orchestrator from "../Orchestrator.ts";
@@ -347,7 +349,7 @@ export function layerWithRegistry<Error>(
     TurnItemPositionStore.layer,
   ).pipe(Layer.provide(layerDatabase));
   const layerEventSinkProvided = EventSink.layerFromStores.pipe(
-    Layer.provide(Layer.mergeAll(layerStores, layerDatabase)),
+    Layer.provide(Layer.mergeAll(layerStores, layerDatabase, ThreadViewers.layer)),
   );
   const layerRuntime = RuntimePolicy.layerEnforcingCeiling.pipe(
     Layer.provide(Layer.merge(layerRuntimeBase, layerServerSettings)),
@@ -361,6 +363,7 @@ export function layerWithRegistry<Error>(
         Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
           getInstance: () => Effect.undefined,
         }),
+        McpAppModelContext.layerEmpty,
         layerStores,
         layerEventSinkProvided,
         IdAllocator.layer,
@@ -457,6 +460,7 @@ export function layerWithRegistry<Error>(
         layerStores,
         layerProviderSessionManagerProvided,
         layerServerSettings,
+        McpAppModelContext.layerEmpty,
       ),
     ),
   );
@@ -577,6 +581,9 @@ export function layerWithRegistry<Error>(
     ThreadCommandExecutor.layer,
   ).pipe(
     Layer.provide(ProviderTurnStartServiceTestkit.layer),
+    Layer.provide(
+      Layer.mock(ComputerService.ComputerService)({ stopForThread: () => Effect.void }),
+    ),
     Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
   );
 

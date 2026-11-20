@@ -13,7 +13,7 @@ import { compareSemverVersions } from "@t3tools/shared/semver";
 
 import {
   type AtomCommandResult,
-  type AtomCommandRunOptions,
+  type AtomCommandOptions,
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "./state/runtime.ts";
@@ -44,11 +44,11 @@ type Target<Input> = { readonly environmentId: EnvironmentId; readonly input: In
 export interface UpdateCheckCommands {
   readonly lookupNpmRelease: (
     target: Target<{ readonly spec: "latest" | "nightly" }>,
-    run: AtomCommandRunOptions,
+    run: Pick<AtomCommandOptions, "signal">,
   ) => Promise<AtomCommandResult<ServerNpmRelease | null, unknown>>;
   readonly refreshProviders: (
     target: Target<{ readonly refreshModels: true }>,
-    run: AtomCommandRunOptions,
+    run: Pick<AtomCommandOptions, "signal">,
   ) => Promise<AtomCommandResult<{ readonly providers: ReadonlyArray<ServerProvider> }, unknown>>;
   readonly timeoutMs?: number;
 }
@@ -65,7 +65,7 @@ function reasonOf(error: unknown): string {
 // A hung request must not hold the whole check, and its spinner, forever. The deadline interrupts
 // the request itself, so a repeat check never overlaps one that is still running.
 async function answered<A>(
-  command: (run: AtomCommandRunOptions) => Promise<AtomCommandResult<A, unknown>>,
+  command: (run: Pick<AtomCommandOptions, "signal">) => Promise<AtomCommandResult<A, unknown>>,
   timeoutMs: number,
 ): Promise<A> {
   const deadline = new AbortController();

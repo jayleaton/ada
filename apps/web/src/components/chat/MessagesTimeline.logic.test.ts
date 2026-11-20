@@ -26,7 +26,7 @@ import {
 import type { TurnDiffSummary } from "../../types";
 import { describe, expect, it } from "vite-plus/test";
 import { MessageId, RunId } from "@t3tools/contracts";
-import { resolveT3McpToolDefinition } from "@t3tools/shared/t3McpToolPresentation";
+
 import {
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
@@ -36,8 +36,8 @@ import {
   isTimelineMinimapTurnVisible,
   resolveAssistantMessageCopyState,
   type MessagesTimelineRow,
-  threadReadLabelPrefix,
   workEntryDisplayLabel,
+  workEntryReadOutput,
 } from "./MessagesTimeline.logic";
 import { workEntryIconName } from "./TimelineWorkEntryRow.logic";
 
@@ -1604,8 +1604,20 @@ describe("deriveMessagesTimelineRows", () => {
           message("steer", 10, "user", "steer"),
           work("work-after-steer", 15),
           message("final", 30, "assistant"),
+          {
+            kind: "event",
+            id: "late-subagent",
+            createdAt: time(50),
+            projectedItem: { item: { type: "subagent", status: "completed", runId } } as never,
+          },
         ],
-        latestRun: { runId, status: "completed", startedAt: time(0), completedAt: time(30) },
+        // A later wake run is the latest, so this turn's times come from its entries.
+        latestRun: {
+          runId: RunId.make("wake-run"),
+          status: "completed",
+          startedAt: time(55),
+          completedAt: time(58),
+        },
         isWorking: false,
         expandedRunIds,
         turnDiffSummaries: [],
@@ -1620,6 +1632,7 @@ describe("deriveMessagesTimelineRows", () => {
       "steer",
       `turn-fold:${segmentKey}`,
       "final",
+      "late-subagent",
     ]);
     expect(collapsed[1]).toMatchObject({ label: "Worked for 30s" });
     expect(collapsed[3]).toMatchObject({ label: "Continued for 20s", createdAt: time(10) });
@@ -1631,6 +1644,7 @@ describe("deriveMessagesTimelineRows", () => {
       `turn-fold:${segmentKey}`,
       "work-after-steer",
       "final",
+      "late-subagent",
     ]);
   });
 
@@ -5150,17 +5164,6 @@ describe("subagent continued by a later turn", () => {
   });
 });
 
-describe("threadReadLabelPrefix", () => {
-  it("recognizes every label the thread-read tool shows", () => {
-    const definition = resolveT3McpToolDefinition("mcp__t3-code__t3_thread_read");
-    if (definition === null) throw new Error("thread-read tool is not registered");
-    const [action, running, completed, detail] = definition.labels;
-    for (const verb of [action, running, completed]) {
-      expect(threadReadLabelPrefix(`${verb} ${detail}`)).toBe(`${verb} thread`);
-    }
-  });
-});
-
 describe("isTimelineMinimapTurnVisible", () => {
   it("keeps a turn lit while only its reply is on screen", () => {
     // Turn rows 10..499, viewport inside the reply.
@@ -5169,5 +5172,16 @@ describe("isTimelineMinimapTurnVisible", () => {
     expect(isTimelineMinimapTurnVisible(500, undefined, 200, 210)).toBe(false);
     expect(isTimelineMinimapTurnVisible(10, 500, 500, 510)).toBe(false);
     expect(isTimelineMinimapTurnVisible(10, 500, null, null)).toBe(false);
+  });
+});
+
+describe("workEntryReadOutput", () => {
+  it("joins relative paths to the workspace root but keeps home paths as written", () => {
+    expect(
+      workEntryReadOutput(
+        { changedFiles: ["src/app.ts", "~/.claude/CLAUDE.md", "~\\.gitconfig"] },
+        "/workspace/t3code",
+      ),
+    ).toBe("/workspace/t3code/src/app.ts\n~/.claude/CLAUDE.md\n~/.gitconfig");
   });
 });

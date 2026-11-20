@@ -3,17 +3,22 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { ProviderInstanceId } from "@t3tools/contracts";
 import { McpProviderSessions } from "@t3tools/provider-core/server/McpProviderSessions";
+import type { McpToolExposureMode } from "@t3tools/provider-core/server/mcpSession";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { McpServer } from "effect/ai";
 
 import { AssetSigner } from "../assets/AssetSigner.ts";
 import { ServerSecretStore } from "../auth/ServerSecretStore.ts";
+import * as ComputerService from "../computer/ComputerService.ts";
 import { ServerConfig } from "../config.ts";
 import { DeviceService } from "../device/DeviceService.ts";
 import { ServerEnvironment } from "../environment/ServerEnvironment.ts";
+import { GitManager } from "../git/GitManager.ts";
 import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import * as McpHttpServer from "../mcp/McpHttpServer.ts";
+import type * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import * as McpToolExposure from "../mcp/McpToolExposure.ts";
 import { PreviewAutomationBroker } from "../mcp/PreviewAutomationBroker.ts";
 import {
   CLAUDE_PROVIDER,
@@ -21,6 +26,7 @@ import {
 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import { OrchestratorV2 } from "../orchestration-v2/Orchestrator.ts";
 import { ProviderAdapterRegistryV2 } from "../orchestration-v2/ProviderAdapterRegistry.ts";
+import { ThreadIssueService } from "../orchestration-v2/ThreadIssueService.ts";
 import { ThreadLaunchService } from "../orchestration-v2/ThreadLaunchService.ts";
 import { ThreadManagementService } from "../orchestration-v2/ThreadManagementService.ts";
 import { ThreadSearch } from "../orchestration-v2/ThreadSearch.ts";
@@ -35,6 +41,7 @@ import { ManagedProjectFolders } from "../project/ManagedProjectFolders.ts";
 import { ProjectCloneTracker } from "../project/ProjectCloneTracker.ts";
 import { ProjectService } from "../project/ProjectService.ts";
 import { ProjectSetupScriptRunner } from "../project/ProjectSetupScriptRunner.ts";
+import { IssueService } from "../issue/IssueService.ts";
 import { PullRequestReviewGuideService } from "../pullRequest/PullRequestReviewGuideService.ts";
 import { PullRequestService } from "../pullRequest/PullRequestService.ts";
 import { ScheduledTaskService } from "../scheduledTasks/ScheduledTaskService.ts";
@@ -52,11 +59,13 @@ import budget from "./agentContextBudget.json" with { type: "json" };
 // Registration only stores tool definitions, so the handlers' services are never called.
 const toolHandlerServices = Layer.mergeAll(
   Layer.mock(AssetSigner)({}),
+  Layer.mock(ComputerService.ComputerService)({}),
   Layer.mock(DeviceService)({}),
   Layer.mock(DocumentText)({}),
   Layer.mock(EnvironmentThemeService)({}),
   Layer.mock(GitVcsDriver)({}),
   Layer.mock(GitWorkflowService)({}),
+  Layer.mock(IssueService)({}),
   Layer.mock(ManagedProjectFolders)({ namedProjectsRoot: "" }),
   Layer.mock(McpProviderSessions)({}),
   Layer.mock(OrchestratorV2)({}),
@@ -74,6 +83,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(PullRequestReviewGuideService)({}),
   Layer.mock(TailnetDevices)({}),
   Layer.mock(PullRequestService)({}),
+  Layer.mock(GitManager)({}),
   Layer.mock(RemoteDelegation)({}),
   Layer.mock(ScheduledTaskService)({}),
   Layer.mock(SecretRequests)({}),
@@ -82,6 +92,7 @@ const toolHandlerServices = Layer.mergeAll(
   Layer.mock(ServerSecretStore)({}),
   Layer.mock(ServerSettingsService)({}),
   Layer.mock(SourceControlRepositoryService)({}),
+  Layer.mock(ThreadIssueService)({}),
   Layer.mock(ThreadLaunchService)({}),
   Layer.mock(ThreadManagementService)({}),
   Layer.mock(ThreadSearch)({}),
@@ -117,6 +128,56 @@ const codexAdditionalContext = () =>
 const layerAdvertisedTools = McpHttpServer.layerTools.pipe(
   Layer.provideMerge(McpHttpServer.layerInProcessMcpServer),
   Layer.provide(toolHandlerServices),
+);
+
+const COMPUTER_TOOLS = [
+  "computer_act",
+  "computer_control",
+  "computer_look",
+  "computer_status",
+  "computer_stop",
+  "computer_use",
+];
+
+it.effect("a computer session lists every computer tool within what Antigravity keeps", () =>
+  Effect.gen(function* () {
+    const mcp = yield* McpServer.McpServer;
+    const exposure = yield* McpToolExposure.McpToolExposure;
+    const listed = (
+      mode: McpToolExposureMode,
+      capabilities: ReadonlyArray<McpInvocationContext.McpCapability>,
+    ) =>
+      mcp.tools
+        .map(({ tool }) => tool)
+        .filter((tool) =>
+          exposure.isListed(
+            { providerSessionId: `${mode}-session`, capabilities: new Set(capabilities) },
+            mode,
+            tool.name,
+          ),
+        );
+
+    const budgeted = listed("budgeted", ["orchestration", "computer"]);
+    expect(budgeted.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["orchestrator_capabilities", "delegate_task", ...COMPUTER_TOOLS]),
+    );
+    // Antigravity kept 33.8 KB of these definitions on a Mac with many skills and dropped the rest.
+    const definitionBytes = budgeted
+      .map(({ name, description, inputSchema }) =>
+        utf8Bytes(JSON.stringify({ name, description, parameters: inputSchema })),
+      )
+      .reduce((total, bytes) => total + bytes, 0);
+    expect(definitionBytes).toBeLessThan(33_800);
+
+    expect(listed("deferred", ["orchestration", "computer"]).map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(COMPUTER_TOOLS),
+    );
+    expect(
+      listed("deferred", ["orchestration"]).filter((tool) => COMPUTER_TOOLS.includes(tool.name)),
+    ).toEqual([]);
+  }).pipe(
+    Effect.provide(McpHttpServer.layerToolExposure.pipe(Layer.provideMerge(layerAdvertisedTools))),
+  ),
 );
 
 // Claude Code loads these tools up front instead of behind ToolSearch, outside this budget.
