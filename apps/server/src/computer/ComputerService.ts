@@ -32,7 +32,7 @@ import type {
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
-import { COMPUTER_LIMITS, ComputerError } from "@t3tools/contracts";
+import { COMPUTER_LIMITS, ComputerError, computerChord } from "@t3tools/contracts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import * as Clock from "effect/Clock";
 import * as Cause from "effect/Cause";
@@ -276,6 +276,8 @@ function describeAct(act: ComputerAct, typed: string | null): string {
       return `open the menu of ${act.label ? `“${clip(act.label)}”` : (act.ref ?? "a control")}`;
     case "open_url":
       return `open ${clip(act.url ?? "a page")}`;
+    case "choose_file":
+      return `choose the file ${clip(act.path ?? "")}`;
   }
 }
 
@@ -912,11 +914,14 @@ const make = Effect.gen(function* () {
       const typed = input.act.action === "type" ? (input.text ?? "") : undefined;
       if (typed === "") return yield* failure("refused", "Give the exact `text` to type.");
       const { text: _text, ...rest } = input;
+      // The helper reads one spelling of a chord: "Command+Shift+G" goes as "cmd+shift+g".
+      const chord = input.act.key === undefined ? null : computerChord(input.act.key);
+      const act = chord === null ? input.act : { ...input.act, key: chord };
       return yield* begin({
         ...rest,
-        goal: describeAct(input.act, typed ?? null),
+        goal: describeAct(act, typed ?? null),
         ...(typed === undefined ? {} : { text: typed }),
-        act: input.act,
+        act,
       });
     },
   );
